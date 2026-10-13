@@ -79,19 +79,31 @@ class AutoMosaicApp:
         threading.Thread(target=self.process_video, daemon=True).start()
 
     def process_video(self):
-        """核心影片處理與馬賽克演算法"""
+        """加入AI追蹤演算法的核心影片處理"""
         cap = cv2.VideoCapture(self.video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # 設定影片輸出格式 (H.264 或 mp4v)
+        # 設定影片輸出格式
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
 
         strength = self.scale_strength.get()
-        x, y, w, h = self.roi
+        
+        # 建立 OpenCV 追蹤器 (CSRT 演算法精準度高，適合追蹤人臉或物件)
+        tracker = cv2.TrackerCSRT_create()
+        
+        # 讀取影片的第一幀，用你剛才框選的 ROI 來初始化追蹤器
+        ret, first_frame = cap.read()
+        if not ret:
+            return
+            
+        tracker.init(first_frame, self.roi)
+        
+        # 為了讓第一幀也處理到，我們把影片讀取指針歸零重頭開始
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         current_frame = 0
         while True:
@@ -99,16 +111,26 @@ class AutoMosaicApp:
             if not ret:
                 break
 
-            # 1. 擷取被框選的區域 (ROI)
-            roi_frame = frame[y:y+h, x:x+w]
-            
-            # 2. 馬賽克演算法：先大幅縮小，再放大回原尺寸 (利用插值法產生像素區塊感)
-            small_w, small_h = max(1, w // strength), max(1, h // strength)
-            small = cv2.resize(roi_frame, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-            mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-            
-            # 3. 將打好馬賽克的區域貼回原圖
-            frame[y:y+h, x:x+w] = mosaic
+            # 更新追蹤器，讓演算法自動找出目標在「這一幀」的新座標
+            success, bbox = tracker.update(frame)
+
+            if success:
+                # 追蹤成功，取得新的 X, Y, 寬度, 高度
+                x, y, w, h = [int(v) for v in bbox]
+                
+                # 防呆保護：避免目標走到畫面邊緣時，座標變成負數導致程式崩潰
+                x = max(0, x)
+                y = max(0, y)
+                w = min(width - x, w)
+                h = min(height - y, h)
+
+                # 在「新的座標」上打馬賽克
+                if w > 0 and h > 0:
+                    roi_frame = frame[y:y+h, x:x+w]
+                    small_w, small_h = max(1, w // strength), max(1, h // strength)
+                    small = cv2.resize(roi_frame, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                    mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+                    frame[y:y+h, x:x+w] = mosaic
 
             # 寫入輸出影片
             out.write(frame)
@@ -118,15 +140,14 @@ class AutoMosaicApp:
             if current_frame % 30 == 0:
                 print(f"進度: {current_frame} / {total_frames} 幀")
 
-        # 釋放資源
         cap.release()
         out.release()
         
-        # 恢復 GUI 狀態
         self.lbl_status.config(text="Processing Complete!", fg="green")
         self.btn_process.config(state=tk.NORMAL)
         self.btn_import.config(state=tk.NORMAL)
         messagebox.showinfo("Success", f"影片已成功儲存至:\n{self.output_path}")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
