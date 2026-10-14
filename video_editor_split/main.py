@@ -383,8 +383,19 @@ class ProVideoEditor(QMainWindow):
         h_max, w_max = frame_copy.shape[:2]
         for m in self.mosaic_tasks:
             if m["start"] <= self.current_frame <= m["end"]:
-                roi = m["tracking_data"].get(self.current_frame) if m.get("type") == "tracking" else m.get("roi")
-                if roi:
+                value = m.get("tracking_data", {}).get(self.current_frame) if m.get("type") == "tracking" else m.get("roi")
+                if value is None:
+                    rois = []
+                elif isinstance(value, (tuple, list)) and len(value) == 4 and all(isinstance(v, (int, float)) for v in value):
+                    rois = [value]  # 相容舊版單一 ROI
+                elif isinstance(value, (tuple, list)):
+                    # 新格式為每影格 list[ROI]；只接受合法四元素 ROI，避免格式異常。
+                    rois = [r for r in value if isinstance(r, (tuple, list)) and len(r) == 4]
+                else:
+                    rois = []
+                for roi in rois:
+                    if not roi or len(roi) != 4:
+                        continue
                     x, y, w, h = map(int, roi)
                     x, y = max(0, x), max(0, y)
                     w, h = min(w_max - x, w), min(h_max - y, h)
@@ -468,7 +479,8 @@ class ProVideoEditor(QMainWindow):
         self.update_task_list_display()
         self.list_tasks.setCurrentRow(len(self.mosaic_tasks) - 1)
         self.refresh_display()
-        self.lbl_status.setText(f"Status: 追蹤完成，最後影格 F{last_frame}")
+        max_targets = max((len(v) if isinstance(v, (list, tuple)) and not (len(v) == 4 and all(isinstance(x, (int, float)) for x in v)) else (1 if v else 0) for v in tracking_data.values()), default=0)
+        self.lbl_status.setText(f"Status: 多目標追蹤完成，最多同時 {max_targets} 個框；最後影格 F{last_frame}")
         if self.monitor_dialog:
             self.monitor_dialog.raise_()
             self.monitor_dialog.activateWindow()
