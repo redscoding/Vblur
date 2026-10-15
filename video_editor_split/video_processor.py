@@ -8,10 +8,6 @@ import time
 import cv2
 import easyocr
 import numpy as np
-try:
-    import supervision as sv
-except ImportError:
-    sv = None
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
@@ -21,7 +17,7 @@ class OCRTrackingThread(QThread):
     monitor_frame_signal = pyqtSignal(object, int, str)
     monitor_data_signal = pyqtSignal(dict)
 
-    # OCR/ByteTrack association runs periodically; CSRT propagates boxes between detections.
+    # OCR association runs periodically; CSRT updates each frame and uncertain jumps are rejected.
     # Search is deliberately cheaper than steady-state tracking. A coarse search can
     # miss a target that appears for fewer than SEARCH_STEP frames; the full-resolution
     # burst after the first hit compensates for initialization misses around that point.
@@ -35,6 +31,9 @@ class OCRTrackingThread(QThread):
     MIN_CONFIDENCE = 0.20
     MAX_PREDICTED_GAP = 10
     DETECT_CANVAS_SIZE = 1920
+    MONITOR_INTERVAL = 2  # update the visual monitor every N frames
+    MOTION_JUMP_DIAGONALS = 1.8
+    MATCH_MIN_SCORE = 0.27
 
     def __init__(self, video_path, start_frame, total_frames, target_text):
         super().__init__()
@@ -144,22 +143,98 @@ class OCRTrackingThread(QThread):
                          ocr_results=raw_texts[:20])
         return unique, elapsed
 
-    def _new_track(self, frame, detection, track_id):
+    @staticmethod
+    def _appearance_signature(frame, roi):
+        """A cheap visual fingerprint. It is supporting evidence, never identity proof."""
+        x, y, w, h = [int(v) for v in roi]
+        fh, fw = frame.shape[:2]
+        x, y = max(0, min(x, fw-1)), max(0, min(y, fh-1))
+        w, h = max(1, min(w, fw-x)), max(1, min(h, fh-y))
+        crop = frame[y:y+h, x:x+w]
+        if crop.size == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (32, 16), interpolation=cv2.INTER_AREA)
+        # Normalize brightness to reduce sensitivity to mild lighting changes.
+        gray = cv2.equalizeHist(gray)
+        return gray
+
+    @staticmethod
+    def _appearance_similarity(a, b):
+        if a is None or b is None or a.shape != b.shape:
+            return 0.0
+        diff = float(np.mean(cv2.absdiff(a, b))) / 255.0
+        return max(0.0, min(1.0, 1.0 - diff))
+
+    def _new_track(self, frame, detection, track_id, frame_no=0):
         roi, text, confidence = detection
         tracker = self._create_tracker()
         tracker.init(frame, roi)
+        center = self._center(roi)
         return {"id": track_id, "tracker": tracker, "roi": roi, "lost": 0,
-                "text": text, "confidence": confidence}
+                "text": text, "confidence": confidence, "state": "OCR_CONFIRMED",
+                "appearance": self._appearance_signature(frame, roi),
+                "center": center, "speed": 0.0, "last_seen_frame": int(frame_no)}
+
+    def _associate_detections(self, frame, detections, tracks, frame_no):
+        """Conservative one-to-one matching; never attach a distant new detection by nearest-neighbour alone."""
+        pairs = []
+        for tid, track in tracks.items():
+            if track["lost"] > self.MAX_PREDICTED_GAP:
+                continue
+            old_roi = track["roi"]
+            old_center = self._center(old_roi)
+            diag = max(20.0, math.hypot(old_roi[2], old_roi[3]))
+            age = max(1, int(frame_no) - int(track.get("last_seen_frame", frame_no-1)))
+            gate = max(45.0, diag * 1.25 + float(track.get("speed", 0.0)) * min(age, 8) * 1.5)
+            for di, det in enumerate(detections):
+                roi = det[0]
+                center = self._center(roi)
+                dist = math.hypot(center[0]-old_center[0], center[1]-old_center[1])
+                if dist > gate:
+                    continue
+                iou = self._iou(old_roi, roi)
+                sig = self._appearance_signature(frame, roi)
+                appearance = self._appearance_similarity(track.get("appearance"), sig)
+                # A plausible position match is required; appearance alone cannot reconnect a target.
+                if iou < 0.02 and dist > max(24.0, diag * 0.55) and appearance < 0.48:
+                    continue
+                proximity = max(0.0, 1.0 - dist / max(1.0, gate))
+                score = 0.40 * proximity + 0.35 * iou + 0.25 * appearance
+                if score >= self.MATCH_MIN_SCORE:
+                    pairs.append((score, tid, di))
+        pairs.sort(reverse=True)
+        used_tracks, used_detections, matches = set(), set(), []
+        for score, tid, di in pairs:
+            if tid in used_tracks or di in used_detections:
+                continue
+            used_tracks.add(tid); used_detections.add(di)
+            matches.append((tid, di, score))
+        return matches, used_detections
 
     def _draw_monitor(self, frame, frame_no, rois, mode):
+        """Green=OCR confirmed, cyan=per-frame tracker, yellow=lost/rejected; only eligible boxes are mosaiced."""
         shown = frame.copy()
-        for track_id, roi in rois:
-            x, y, w, h = roi
-            cv2.rectangle(shown, (x, y), (x+w, y+h), (0, 220, 0), 2)
-            cv2.putText(shown, f"ID {track_id}", (x, max(18, y-5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 2, cv2.LINE_AA)
-        cv2.putText(shown, f"Frame {frame_no} | {mode} | targets={len(rois)}", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        color_by_state = {"OCR_CONFIRMED": (0, 220, 0), "TRACKING": (255, 210, 0),
+                          "LOST": (0, 190, 255), "JUMP_REJECTED": (0, 0, 255)}
+        for item in rois:
+            if len(item) == 2:
+                track_id, roi = item; state = "TRACKING"; confidence = None
+            else:
+                track_id, roi, state, confidence = item
+            x, y, w, h = [int(v) for v in roi]
+            color = color_by_state.get(state, (255, 255, 255))
+            cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
+            label = f"ID {track_id} {state}"
+            if confidence is not None:
+                label += f" {float(confidence):.2f}"
+            cv2.putText(shown, label, (x, max(18, y-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+        cv2.putText(shown, f"Frame {frame_no} | {mode} | maskable={sum(1 for r in rois if len(r) >= 3 and r[2] in ('OCR_CONFIRMED','TRACKING'))}", (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+        # Legend is burned into the monitor preview only, not the exported video.
+        cv2.putText(shown, "GREEN OCR | CYAN tracked | YELLOW lost | RED motion jump rejected",
+                    (12, 53), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         self.monitor_frame_signal.emit(shown, int(frame_no), mode)
 
     def run(self):
@@ -168,13 +243,8 @@ class OCRTrackingThread(QThread):
         last_frame = self.start_frame
         success = False
         try:
-            if sv is None:
-                raise RuntimeError(
-                    "尚未安裝 ByteTrack 依賴套件。請在目前 Python 環境執行：python -m pip install supervision"
-                )
-
-            self.progress_signal.emit(self.start_frame, "正在載入 OCR 與 ByteTrack...")
-            self._report("loading", "正在載入 EasyOCR 與 ByteTrack", self.start_frame)
+            self.progress_signal.emit(self.start_frame, "正在載入 OCR 與外觀/運動關聯...")
+            self._report("loading", "正在載入 EasyOCR；啟用保守的逐幀追蹤關聯", self.start_frame)
             reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -185,52 +255,8 @@ class OCRTrackingThread(QThread):
             if not ret:
                 raise RuntimeError("無法讀取起始影格。")
 
-            # ByteTrack associates OCR detections at detection steps. CSRT propagates each
-            # confirmed track on intervening frames, so the output still has per-frame ROIs.
-            byte_tracker = sv.ByteTrack(
-                track_activation_threshold=0.10,
-                lost_track_buffer=30,
-                minimum_matching_threshold=0.80,
-                frame_rate=max(1, int(round(fps / self.OCR_INTERVAL))),
-                minimum_consecutive_frames=1,
-            )
-
-            def update_bytetrack(detections):
-                if detections:
-                    xyxy = np.asarray([
-                        [r[0], r[1], r[0] + r[2], r[1] + r[3]]
-                        for r, _txt, _conf in detections
-                    ], dtype=np.float32)
-                    confidence = np.asarray([max(0.01, min(1.0, float(d[2]))) for d in detections], dtype=np.float32)
-                    dets = sv.Detections(
-                        xyxy=xyxy,
-                        confidence=confidence,
-                        class_id=np.zeros(len(detections), dtype=int),
-                    )
-                else:
-                    dets = sv.Detections.empty()
-                return byte_tracker.update_with_detections(dets)
-
-            def map_track_detections(detections, tracked):
-                """Map ByteTrack output boxes to OCR detections; each detection used once."""
-                mapped = []
-                if len(tracked) == 0 or tracked.tracker_id is None:
-                    return mapped
-                used = set()
-                for j, box in enumerate(tracked.xyxy):
-                    tid = int(tracked.tracker_id[j])
-                    tracked_roi = self._clip(frame, (box[0], box[1], box[2]-box[0], box[3]-box[1]))
-                    best_i, best_iou = None, 0.0
-                    for i, det in enumerate(detections):
-                        if i in used:
-                            continue
-                        score = self._iou(tracked_roi, det[0])
-                        if score > best_iou:
-                            best_i, best_iou = i, score
-                    if best_i is not None and best_iou >= 0.10:
-                        used.add(best_i)
-                        mapped.append((tid, detections[best_i]))
-                return mapped
+            # We do not force detections onto ByteTrack IDs. A conservative one-to-one
+            # association below uses motion gating, overlap and a lightweight appearance signature.
 
             # Phase 1: fast coarse search. OCR runs on a resized image every few frames,
             # instead of spending a full-resolution OCR pass on every empty frame.
@@ -338,24 +364,14 @@ class OCRTrackingThread(QThread):
             initial_frame_no = max(detected_burst_frames)
             frame = burst_frames[initial_frame_no]
             detections = burst_cache[initial_frame_no]
-            tracked = update_bytetrack(detections)
-            mapped = map_track_detections(detections, tracked)
             tracks = {}
-            used_detection_indices = set()
-            for tid, detection in mapped:
-                tracks[tid] = self._new_track(frame, detection, tid)
-                for di, candidate in enumerate(detections):
-                    if di not in used_detection_indices and candidate is detection:
-                        used_detection_indices.add(di)
-                        break
-            manual_id = 100000
-            for di, detection in enumerate(detections):
-                if di in used_detection_indices:
-                    continue
+            next_track_id = 1
+            for detection in detections:
+                # Every distinct OCR box starts as its own track; no path is inferred between boxes.
                 if any(self._iou(detection[0], t["roi"]) >= 0.80 for t in tracks.values()):
                     continue
-                tracks[manual_id] = self._new_track(frame, detection, manual_id)
-                manual_id += 1
+                tracks[next_track_id] = self._new_track(frame, detection, next_track_id, initial_frame_no)
+                next_track_id += 1
 
             # Save direct OCR boxes for every frame in the initialization burst. This gives
             # the export an immediate mask even when CSRT's first update would be imperfect.
@@ -371,12 +387,17 @@ class OCRTrackingThread(QThread):
                     if t["lost"] > self.MAX_PREDICTED_GAP:
                         continue
                     roi = tuple(map(int, self._clip(current_frame, t["roi"])))
-                    # Deduplicate overlapping boxes only, never by text or ID.
+                    state = t.get("state", "TRACKING")
+                    # Important: only a valid per-frame tracker update or direct OCR confirmation
+                    # contributes a mask. A stale box is drawn as LOST for diagnostics, never masked.
+                    draw_state = "JUMP_REJECTED" if state == "JUMP_REJECTED" else (state if t["lost"] == 0 else "LOST")
+                    draw.append((tid, roi, draw_state, t.get("confidence")))
+                    if t["lost"] != 0 or state in ("LOST", "JUMP_REJECTED"):
+                        continue
                     if not any(self._iou(roi, old) > 0.88 for old in rois):
                         rois.append(roi)
-                        draw.append((tid, roi))
-                # Keep high-resolution OCR boxes from the initialization burst even if a
-                # tracker has not stabilized yet on that exact frame.
+                # OCR detections in the initialization burst are direct observations and are masked
+                # on their own frames only. This does not create any interpolated path.
                 for detection in burst_cache.get(frame_no, []):
                     roi = tuple(map(int, self._clip(current_frame, detection[0])))
                     if not any(self._iou(roi, old) > 0.88 for old in rois):
@@ -385,9 +406,9 @@ class OCRTrackingThread(QThread):
                 return draw
 
             data[initial_frame_no] = [tuple(map(int, d[0])) for d in detections]
-            initial = [(tid, t["roi"]) for tid, t in tracks.items()]
-            self._draw_monitor(frame, initial_frame_no, initial, "BURST INIT + BYTETRACK")
-            self._report("locked", f"高畫質初始化完成：第 {initial_frame_no} 幀有 {len(detections)} 個目標區域，軌跡 {len(tracks)} 條",
+            initial = [(tid, t["roi"], "OCR_CONFIRMED", t.get("confidence")) for tid, t in tracks.items()]
+            self._draw_monitor(frame, initial_frame_no, initial, "OCR INITIALIZATION")
+            self._report("locked", f"高畫質初始化完成：第 {initial_frame_no} 幀有 {len(detections)} 個目標區域，建立 {len(tracks)} 個追蹤 ID",
                          initial_frame_no, target_text=self.target_text, target_count=len(detections), tracked_frames=len(burst_cache))
             self.progress_signal.emit(initial_frame_no,
                 f"初始化找到 {len(detections)} 個目標，開始追蹤")
@@ -404,15 +425,38 @@ class OCRTrackingThread(QThread):
                     break
                 last_frame = i
 
-                # Dense frame-by-frame propagation by CSRT; a failed update keeps the last
-                # plausible box only for a bounded grace window, then is excluded from masking.
+                # Update every frame. Reject implausibly large CSRT jumps instead of
+                # letting the box teleport to another similar-looking object.
                 for t in tracks.values():
-                    ok, bbox = t["tracker"].update(frame)
+                    # Once a tracker is lost or a jump was rejected, do not let CSRT
+                    # silently declare itself recovered. Only a later OCR association may
+                    # re-lock the ID; this avoids masking a different object after drift.
+                    if t["lost"] > 0:
+                        t["lost"] += 1
+                        if t.get("state") != "JUMP_REJECTED":
+                            t["state"] = "LOST"
+                        continue
+                    previous_roi = t["roi"]
+                    previous_center = self._center(previous_roi)
+                    ok, bbox = t["tracker"].update(frame) if t.get("tracker") is not None else (False, previous_roi)
                     if ok and bbox[2] > 1 and bbox[3] > 1:
-                        t["roi"] = self._clip(frame, bbox)
-                        t["lost"] = 0
+                        candidate_roi = self._clip(frame, bbox)
+                        candidate_center = self._center(candidate_roi)
+                        distance = math.hypot(candidate_center[0]-previous_center[0], candidate_center[1]-previous_center[1])
+                        diag = max(20.0, math.hypot(previous_roi[2], previous_roi[3]))
+                        max_step = max(35.0, diag * self.MOTION_JUMP_DIAGONALS)
+                        if distance <= max_step:
+                            t["speed"] = 0.70 * float(t.get("speed", 0.0)) + 0.30 * distance
+                            t["roi"] = candidate_roi
+                            t["center"] = candidate_center
+                            t["lost"] = 0
+                            t["state"] = "TRACKING"
+                        else:
+                            t["lost"] += 1
+                            t["state"] = "JUMP_REJECTED"
                     else:
                         t["lost"] += 1
+                        t["state"] = "LOST"
 
                 active_tracks = [t for t in tracks.values() if t["lost"] <= self.MAX_PREDICTED_GAP]
                 adaptive_interval = self.ADAPTIVE_OCR_INTERVAL if any(t["lost"] > 0 for t in active_tracks) else self.OCR_INTERVAL
@@ -425,57 +469,42 @@ class OCRTrackingThread(QThread):
                         detections = burst_cache[i]
                     else:
                         detections, elapsed = self._ocr_all(reader, frame, i)
-                    tracked = update_bytetrack(detections)
-                    mapped = map_track_detections(detections, tracked)
-                    seen_ids = set()
-                    for tid, detection in mapped:
+                    matches, used_detection_indices = self._associate_detections(frame, detections, tracks, i)
+                    for tid, di, match_score in matches:
+                        detection = detections[di]
                         roi, text, conf = detection
-                        seen_ids.add(tid)
-                        if tid in tracks:
-                            t = tracks[tid]
-                            t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf})
-                            t["tracker"] = self._create_tracker()
-                            t["tracker"].init(frame, roi)
-                        else:
-                            tracks[tid] = self._new_track(frame, detection, tid)
+                        t = tracks[tid]
+                        t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf,
+                                  "state": "OCR_CONFIRMED", "last_seen_frame": i,
+                                  "center": self._center(roi)})
+                        # Keep the original appearance template stable; do not learn from uncertain matches.
+                        t["tracker"] = self._create_tracker()
+                        t["tracker"].init(frame, roi)
 
-                    # ByteTrack may not emit a tracker_id for a newly seen detection until its
-                    # activation rules pass. Keep unmatched OCR detections rather than losing them.
-                    matched_detection_rois = [det[0] for _tid, det in mapped]
-                    for detection in detections:
-                        if any(self._iou(detection[0], r) >= 0.10 for r in matched_detection_rois):
+                    # Unmatched detections start new IDs instead of being attached to the nearest
+                    # existing track by position alone. This prevents a far-away duplicate from
+                    # being treated as the same moving object.
+                    for di, detection in enumerate(detections):
+                        if di in used_detection_indices:
                             continue
-                        # Associate unmatched detection with a nearby existing track if plausible;
-                        # otherwise create a temporary independent track. It will be reconciled
-                        # by ByteTrack on a later OCR step.
-                        candidates = []
-                        for tid, t in tracks.items():
-                            c1, c2 = self._center(t["roi"]), self._center(detection[0])
-                            scale = max(20.0, math.hypot(t["roi"][2], t["roi"][3]))
-                            dist = math.hypot(c1[0]-c2[0], c1[1]-c2[1])
-                            if self._iou(t["roi"], detection[0]) >= 0.10 or dist <= scale * 1.5:
-                                candidates.append((dist, tid))
-                        if candidates:
-                            _dist, tid = min(candidates)
-                            t = tracks[tid]
-                            t.update({"roi": detection[0], "lost": 0, "text": detection[1], "confidence": detection[2]})
-                            t["tracker"] = self._create_tracker(); t["tracker"].init(frame, detection[0])
-                        else:
-                            tid = max(100000, max([99999, *tracks.keys()]) + 1)
-                            tracks[tid] = self._new_track(frame, detection, tid)
+                        if any(self._iou(detection[0], t["roi"]) > 0.82 for t in tracks.values() if t["lost"] == 0):
+                            continue
+                        tracks[next_track_id] = self._new_track(frame, detection, next_track_id, i)
+                        next_track_id += 1
 
-                    # Prune stale tracks after ByteTrack had a chance to reconnect detections.
+                    # Keep briefly lost tracks available for conservative re-identification,
+                    # but never use their stale box as a mosaic ROI.
                     tracks = {tid: t for tid, t in tracks.items() if t["lost"] <= self.MAX_PREDICTED_GAP}
-                    self._report("tracking", f"ByteTrack 關聯完成：偵測 {len(detections)} 個，活躍軌跡 {len(tracks)} 個",
+                    self._report("tracking", f"外觀/運動關聯完成：OCR 偵測 {len(detections)} 個，追蹤 ID {len(tracks)} 個",
                                  i, target_count=len(tracks), elapsed_seconds=elapsed,
                                  lost_count=sum(t["lost"] > 0 for t in tracks.values()),
                                  patience=self.MAX_PREDICTED_GAP, detection_count=len(detections))
 
                 rois_with_ids = record_frame(i, frame)
-                if i % 12 == 0:
-                    self._draw_monitor(frame, i, rois_with_ids,
-                                       "BYTETRACK + CSRT" if rois_with_ids else "SEARCHING")
-                    self.progress_signal.emit(i, f"追蹤 F{i}/{self.total_frames}，有效框 {len(rois_with_ids)}")
+                if i % self.MONITOR_INTERVAL == 0:
+                    mode = "OCR CONFIRMED + CSRT" if any(t["lost"] == 0 for t in tracks.values()) else "SEARCHING / LOST"
+                    self._draw_monitor(frame, i, rois_with_ids, mode)
+                    self.progress_signal.emit(i, f"追蹤 F{i}/{self.total_frames}，可遮罩框 {len(data.get(i, []))}")
 
             success = bool(data)
             self._report("finished", stop_reason, last_frame, tracked_frames=len(data),
