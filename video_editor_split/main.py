@@ -60,6 +60,137 @@ class VideoDisplayWidget(QWidget):
                                (self.height() - scaled.height()) // 2, scaled)
 
 
+
+class ROISelectionWidget(QWidget):
+    """Qt-native ROI selector; avoids cv2.selectROI / OpenCV HighGUI dependencies."""
+    def __init__(self, frame, parent=None):
+        super().__init__(parent)
+        self.frame_h, self.frame_w = frame.shape[:2]
+        self.pixmap = frame_to_pixmap(frame)
+        self.start_point = None
+        self.end_point = None
+        self.dragging = False
+        self.selected_roi = None
+        self.setMinimumSize(640, 360)
+        self.setMouseTracking(True)
+
+    def _image_rect(self):
+        if self.pixmap is None or self.width() <= 0 or self.height() <= 0:
+            return None
+        scaled = self.pixmap.size()
+        scaled.scale(self.size(), Qt.KeepAspectRatio)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        return x, y, scaled.width(), scaled.height()
+
+    def _widget_to_image(self, point):
+        rect = self._image_rect()
+        if rect is None:
+            return None
+        x0, y0, dw, dh = rect
+        px, py = point.x(), point.y()
+        if px < x0 or py < y0 or px > x0 + dw or py > y0 + dh:
+            return None
+        ix = int(round((px - x0) * self.frame_w / max(1, dw)))
+        iy = int(round((py - y0) * self.frame_h / max(1, dh)))
+        return (max(0, min(ix, self.frame_w - 1)),
+                max(0, min(iy, self.frame_h - 1)))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101010"))
+        rect = self._image_rect()
+        if rect is not None:
+            x, y, w, h = rect
+            scaled = self.pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(x, y, scaled)
+        if self.start_point and self.end_point:
+            left = min(self.start_point.x(), self.end_point.x())
+            top = min(self.start_point.y(), self.end_point.y())
+            right = max(self.start_point.x(), self.end_point.x())
+            bottom = max(self.start_point.y(), self.end_point.y())
+            painter.setPen(QColor("#00FF70"))
+            painter.drawRect(left, top, right - left, bottom - top)
+            painter.fillRect(left, top, right - left, bottom - top, QColor(0, 255, 112, 35))
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        if self._widget_to_image(event.pos()) is None:
+            return
+        self.start_point = event.pos()
+        self.end_point = event.pos()
+        self.dragging = True
+        self.selected_roi = None
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            self.end_point = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or not self.dragging:
+            return
+        self.end_point = event.pos()
+        self.dragging = False
+        p1 = self._widget_to_image(self.start_point)
+        p2 = self._widget_to_image(self.end_point)
+        if p1 and p2:
+            x1, y1 = p1
+            x2, y2 = p2
+            x, y = min(x1, x2), min(y1, y2)
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            if w >= 4 and h >= 4:
+                self.selected_roi = (x, y, w, h)
+        self.update()
+
+    def get_roi(self):
+        return self.selected_roi
+
+
+class ROISelectionDialog(QDialog):
+    """A modal selection dialog rendered by Qt, independent of OpenCV GUI support."""
+    def __init__(self, frame, parent=None, title="框選目標"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1000, 720)
+        self.setMinimumSize(680, 440)
+        self.setStyleSheet(MODERN_THEME)
+        layout = QVBoxLayout(self)
+        self.selector = ROISelectionWidget(frame, self)
+        layout.addWidget(self.selector, 1)
+        tip = QLabel("用滑鼠左鍵拖曳框選目標；綠框為選取範圍。按「確認」完成，按「取消」放棄。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.btn_cancel = QPushButton("取消")
+        self.btn_ok = QPushButton("確認框選")
+        self.btn_ok.setObjectName("primary")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_ok.clicked.connect(self._accept_if_valid)
+        buttons.addWidget(self.btn_cancel)
+        buttons.addWidget(self.btn_ok)
+        layout.addLayout(buttons)
+
+    def _accept_if_valid(self):
+        if self.selector.get_roi() is None:
+            QMessageBox.warning(self, "尚未框選", "請先用滑鼠拖曳框出目標區域。")
+            return
+        self.accept()
+
+    def get_roi(self):
+        return self.selector.get_roi()
+
+
+def select_roi_dialog(frame, parent=None, title="框選目標"):
+    dialog = ROISelectionDialog(frame, parent, title)
+    if dialog.exec_() == QDialog.Accepted:
+        return dialog.get_roi()
+    return None
+
+
 def frame_to_pixmap(frame):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
@@ -236,8 +367,8 @@ class ProVideoEditor(QMainWindow):
         mosaic_layout = QVBoxLayout(group_mosaic)
         ocr_row = QHBoxLayout()
         self.txt_ocr = QLineEdit()
-        self.txt_ocr.setPlaceholderText("輸入目標文字 (如：車牌)")
-        self.btn_ocr = QPushButton("🔤 掃描並追蹤")
+        self.txt_ocr.setPlaceholderText("選填：目標文字（追蹤失效時才用 OCR 補救）")
+        self.btn_ocr = QPushButton("🎯 手動框選並追蹤")
         self.btn_ocr.setObjectName("primary")
         self.btn_ocr.setEnabled(False)
         self.btn_ocr.clicked.connect(self.start_ocr_tracking)
@@ -432,27 +563,37 @@ class ProVideoEditor(QMainWindow):
         self.lbl_time.setText(f"{current_seconds // 60:02d}:{current_seconds % 60:02d} / {total_seconds // 60:02d}:{total_seconds % 60:02d}")
 
     def start_ocr_tracking(self):
-        target = self.txt_ocr.text().strip()
-        if not target:
-            QMessageBox.warning(self, "輸入錯誤", "請先輸入要追蹤的目標文字！")
-            return
-        if not self.video_path:
+        if not self.video_path or self.current_raw_frame is None:
             QMessageBox.warning(self, "尚未匯入影片", "請先匯入影片。")
             return
         if self.ocr_thread and self.ocr_thread.isRunning():
-            QMessageBox.information(self, "正在執行", "目前已有一個 OCR 追蹤工作在執行。")
+            QMessageBox.information(self, "正在執行", "目前已有一個追蹤工作在執行。")
             return
         if self.is_playing:
             self.toggle_play()
 
+        roi = select_roi_dialog(
+            self.current_raw_frame, self,
+            title="手動框選追蹤目標（拖曳滑鼠後按確認）"
+        )
+        if roi is None:
+            self.lbl_status.setText("Status: 已取消手動框選")
+            return
+
+        target = self.txt_ocr.text().strip()
         self.monitor_dialog = OCRMonitorDialog(self)
         self.monitor_dialog.show()
-        self.progress_dialog = QProgressDialog("正在啟動 AI 引擎...", "取消追蹤", self.current_frame,
-                                                max(self.current_frame + 1, self.total_frames), self)
-        self.progress_dialog.setWindowTitle("OCR Tracking")
+        self.progress_dialog = QProgressDialog(
+            "正在啟動快速追蹤...", "取消追蹤", self.current_frame,
+            max(self.current_frame + 1, self.total_frames), self
+        )
+        self.progress_dialog.setWindowTitle("Manual Fast Tracking")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setAutoClose(False)
-        self.ocr_thread = OCRTrackingThread(self.video_path, self.current_frame, self.total_frames, target)
+        self.ocr_thread = OCRTrackingThread(
+            self.video_path, self.current_frame, self.total_frames,
+            target_text=target, initial_roi=tuple(map(int, roi)), tracker_name="KCF"
+        )
         self.progress_dialog.canceled.connect(self.ocr_thread.requestInterruption)
         self.ocr_thread.progress_signal.connect(self.update_ocr_progress)
         self.ocr_thread.monitor_frame_signal.connect(self.monitor_dialog.update_frame)
@@ -473,7 +614,7 @@ class ProVideoEditor(QMainWindow):
             self.progress_dialog.close()
         self.btn_ocr.setEnabled(bool(self.video_path))
         if not success or not tracking_data:
-            QMessageBox.warning(self, "追蹤未完成", "沒有取得可用的追蹤資料。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。")
+            QMessageBox.warning(self, "追蹤未完成", "沒有取得完整的追蹤結果，或工作已取消。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。")
             self.lbl_status.setText("Status: OCR tracking failed")
             return
         task = {
@@ -488,7 +629,7 @@ class ProVideoEditor(QMainWindow):
         self.list_tasks.setCurrentRow(len(self.mosaic_tasks) - 1)
         self.refresh_display()
         max_targets = max((len(v) if isinstance(v, (list, tuple)) and not (len(v) == 4 and all(isinstance(x, (int, float)) for x in v)) else (1 if v else 0) for v in tracking_data.values()), default=0)
-        self.lbl_status.setText(f"Status: 多目標追蹤完成，最多同時 {max_targets} 個框；最後影格 F{last_frame}")
+        self.lbl_status.setText(f"Status: 手動目標追蹤完成；最後影格 F{last_frame}；請檢查監控與輸出結果")
         if self.monitor_dialog:
             self.monitor_dialog.raise_()
             self.monitor_dialog.activateWindow()
@@ -498,9 +639,10 @@ class ProVideoEditor(QMainWindow):
             return
         if self.is_playing:
             self.toggle_play()
-        QMessageBox.information(self, "操作提示", "請框選要固定打碼的區域，畫完按 ENTER。")
-        roi = cv2.selectROI("Select ROI", self.current_raw_frame, fromCenter=False, showCrosshair=True)
-        cv2.destroyAllWindows()
+        roi = select_roi_dialog(
+            self.current_raw_frame, self,
+            title="手動框選固定馬賽克區域"
+        )
         if roi and roi[2] > 0 and roi[3] > 0:
             self.mosaic_tasks.append({"type": "static", "start": self.current_frame,
                                      "end": max(0, self.total_frames - 1), "roi": tuple(map(int, roi)), "strength": 15})

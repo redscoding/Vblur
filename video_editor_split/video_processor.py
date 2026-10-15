@@ -1,570 +1,378 @@
-"""Multi-target OCR tracking and frame-accurate mosaic export.
+"""Fast manual-initialization tracking for video mosaic.
 
-Requires: opencv-contrib-python, easyocr, PyQt5.
-tracking_data format: {absolute_frame_index: [(x, y, w, h), ...]}
+Option B v5:
+- The user manually selects one target in the current frame.
+- Every subsequent frame uses full-resolution, full-frame 2D template matching as the primary method.
+- KCF/MOSSE is deliberately not used to decide the output box, avoiding local-tracker drift.
+- OpenCV matchTemplate evaluates every legal x/y placement for each configured scale.
+- EasyOCR is optional and only used as a last-resort local recovery when target_text is supplied.
+
+tracking_data format:
+    {absolute_frame_index: [(x, y, width, height), ...]}
+
+Requires: opencv-contrib-python, numpy, PyQt5.
+EasyOCR is optional unless OCR recovery is used.
 """
-import math
+from __future__ import annotations
+
 import time
+import math
+from typing import Optional
+
 import cv2
-import easyocr
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
-try:
-    from global_feature_gate import GlobalFeatureGate
-except ImportError:  # package import fallback
-    from .global_feature_gate import GlobalFeatureGate
-
 
 class OCRTrackingThread(QThread):
+    """Compatibility name retained so the existing GUI can import this class."""
+
     progress_signal = pyqtSignal(int, str)
     finished_signal = pyqtSignal(dict, int, bool)
     monitor_frame_signal = pyqtSignal(object, int, str)
     monitor_data_signal = pyqtSignal(dict)
 
-    # OCR association runs periodically; CSRT updates each frame and uncertain jumps are rejected.
-    # Search is deliberately cheaper than steady-state tracking. A coarse search can
-    # miss a target that appears for fewer than SEARCH_STEP frames; the full-resolution
-    # burst after the first hit compensates for initialization misses around that point.
-    SEARCH_STEP = 3  # minimum search interval; GlobalFeatureGate backs off adaptively
-    SEARCH_MAX_DIM = 960
-    SEARCH_CANVAS_SIZE = 1280
-    # Keep the high-resolution initialization burst short to avoid long pauses.
-    INIT_BURST_BEFORE = 1
-    INIT_BURST_AFTER = 2
-    OCR_INTERVAL = 6
-    ADAPTIVE_OCR_INTERVAL = 2
-    MIN_CONFIDENCE = 0.20
-    MAX_PREDICTED_GAP = 10
-    DETECT_CANVAS_SIZE = 1920
-    MONITOR_INTERVAL = 1  # refresh monitor every frame (OCR itself remains synchronous)
-    MOTION_JUMP_DIAGONALS = 1.8
-    MATCH_MIN_SCORE = 0.27
+    # Tune these after measuring your own videos.
+    MONITOR_INTERVAL = 1
+    PROGRESS_INTERVAL = 10
+    MIN_TEMPLATE_SCORE = 0.48
+    STALE_GRACE_FRAMES = 1
+    OCR_RETRY_COOLDOWN = 12
+    # Every scale scans all legal (x, y) positions in the full-resolution frame.
+    TEMPLATE_SCALES = (0.85, 1.0, 1.15)
 
-    def __init__(self, video_path, start_frame, total_frames, target_text):
+    def __init__(self, video_path, start_frame, total_frames, target_text="",
+                 initial_roi=None, tracker_name="KCF"):
         super().__init__()
-        self.video_path = video_path
+        self.video_path = str(video_path)
         self.start_frame = max(0, int(start_frame))
         self.total_frames = max(0, int(total_frames))
-        self.target_text = str(target_text or "")
+        self.target_text = str(target_text or "").strip()
+        self.initial_roi = tuple(map(int, initial_roi)) if initial_roi else None
+        self.tracker_name = str(tracker_name or "KCF").upper()
+        self._cancelled = False
+
+    def requestInterruption(self):
+        self._cancelled = True
+        super().requestInterruption()
 
     def _report(self, stage, message, frame_no=None, **extra):
-        self.monitor_data_signal.emit({"stage": stage, "message": message,
-            "frame": frame_no, "clock": time.monotonic(), **extra})
-
-    @staticmethod
-    def _create_tracker():
-        if hasattr(cv2, "TrackerCSRT_create"):
-            return cv2.TrackerCSRT_create()
-        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
-            return cv2.legacy.TrackerCSRT_create()
-        raise RuntimeError("目前的 OpenCV 沒有 CSRT tracker，請安裝 opencv-contrib-python。")
+        self.monitor_data_signal.emit({
+            "stage": stage, "message": message, "frame": frame_no,
+            "clock": time.monotonic(), **extra
+        })
 
     @staticmethod
     def _clip(frame, roi):
         h, w = frame.shape[:2]
         x, y, rw, rh = [int(round(float(v))) for v in roi]
-        x = max(0, min(x, w - 1)); y = max(0, min(y, h - 1))
-        rw = max(1, min(rw, w - x)); rh = max(1, min(rh, h - y))
-        return (x, y, rw, rh)
+        x = max(0, min(x, w - 1))
+        y = max(0, min(y, h - 1))
+        rw = max(1, min(rw, w - x))
+        rh = max(1, min(rh, h - y))
+        return x, y, rw, rh
 
     @staticmethod
-    def _center(r):
-        return r[0] + r[2] / 2.0, r[1] + r[3] / 2.0
+    def _center(roi):
+        x, y, w, h = roi
+        return x + w / 2.0, y + h / 2.0
 
     @staticmethod
-    def _iou(a, b):
-        ax, ay, aw, ah = a; bx, by, bw, bh = b
-        ix1, iy1 = max(ax, bx), max(ay, by)
-        ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
-        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        union = aw * ah + bw * bh - inter
-        return inter / union if union > 0 else 0.0
+    def _create_tracker(name="KCF"):
+        """Prefer fast KCF, then MOSSE, then CSRT as a compatibility fallback."""
+        candidates = []
+        if name == "MOSSE":
+            candidates += [
+                ("legacy", "TrackerMOSSE_create"),
+                ("root", "TrackerMOSSE_create"),
+                ("legacy", "TrackerKCF_create"),
+                ("root", "TrackerKCF_create"),
+            ]
+        else:
+            candidates += [
+                ("legacy", "TrackerKCF_create"),
+                ("root", "TrackerKCF_create"),
+                ("legacy", "TrackerMOSSE_create"),
+                ("root", "TrackerMOSSE_create"),
+            ]
+        candidates += [
+            ("legacy", "TrackerCSRT_create"),
+            ("root", "TrackerCSRT_create"),
+        ]
+        for scope, attr in candidates:
+            owner = getattr(cv2, "legacy", None) if scope == "legacy" else cv2
+            factory = getattr(owner, attr, None) if owner is not None else None
+            if callable(factory):
+                try:
+                    return factory(), attr.replace("Tracker", "").replace("_create", "")
+                except Exception:
+                    pass
+        raise RuntimeError(
+            "找不到 OpenCV 追蹤器。請安裝 opencv-contrib-python："
+            "python -m pip install -U opencv-contrib-python"
+        )
 
     @staticmethod
-    def _normalize(text):
-        # Case-insensitive; ignore whitespace and common punctuation but preserve letters/numbers.
-        return "".join(ch for ch in str(text).casefold() if ch.isalnum())
-
-    def _ocr_all(self, reader, frame, frame_no, *, coordinate_frame=None,
-                 canvas_size=None, report=True):
-        """Detect every occurrence of the requested text in one EasyOCR pass.
-
-        `frame` may be a downscaled search image. If `coordinate_frame` is supplied,
-        boxes are mapped back to that original frame's coordinate system.
-        """
-        started = time.monotonic()
-        target = self._normalize(self.target_text)
-        found = []
-        raw_texts = []
-        try:
-            results = reader.readtext(
-                frame, detail=1, paragraph=False, decoder="greedy",
-                min_size=8, text_threshold=0.6, low_text=0.35,
-                link_threshold=0.35, canvas_size=int(canvas_size or self.DETECT_CANVAS_SIZE),
-                mag_ratio=1.0, slope_ths=0.1, ycenter_ths=0.35,
-                height_ths=0.35, width_ths=0.1, add_margin=0.05,
-                batch_size=16, workers=0,
-            )
-            h, w = frame.shape[:2]
-            if coordinate_frame is not None:
-                oh, ow = coordinate_frame.shape[:2]
-                sx, sy = ow / float(w), oh / float(h)
-                clip_frame = coordinate_frame
-            else:
-                sx = sy = 1.0
-                clip_frame = frame
-            for item in results or []:
-                if len(item) < 3:
-                    continue
-                points, text, confidence = item[0], str(item[1]), float(item[2])
-                if report:
-                    raw_texts.append({"text": text, "confidence": confidence})
-                if confidence < self.MIN_CONFIDENCE or not target or target not in self._normalize(text):
-                    continue
-                pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-                x1, y1 = int(np.floor(pts[:, 0].min())), int(np.floor(pts[:, 1].min()))
-                x2, y2 = int(np.ceil(pts[:, 0].max())), int(np.ceil(pts[:, 1].max()))
-                bw, bh = x2 - x1, y2 - y1
-                if bw <= 0 or bh <= 0:
-                    continue
-                px, py = max(2, int(bw * 0.15)), max(2, int(bh * 0.25))
-                roi_small = self._clip(frame, (x1-px, y1-py, bw+2*px, bh+2*py))
-                x, y, rw, rh = roi_small
-                roi = self._clip(clip_frame, (x*sx, y*sy, rw*sx, rh*sy))
-                found.append((roi, text, confidence))
-        except Exception as exc:
-            self._report("error", f"OCR 偵測失敗：{type(exc).__name__}: {exc}", frame_no)
-
-        found.sort(key=lambda item: item[2], reverse=True)
-        unique = []
-        for item in found:
-            if not any(self._iou(item[0], old[0]) > 0.82 for old in unique):
-                unique.append(item)
-        elapsed = time.monotonic() - started
-        if report:
-            self._report("ocr_done", f"OCR 完成，耗時 {elapsed:.2f} 秒；符合目標 {len(unique)} 個",
-                         frame_no, elapsed_seconds=elapsed, result_count=len(raw_texts),
-                         target_count=len(unique), target_text=self.target_text,
-                         ocr_results=raw_texts[:20])
-        return unique, elapsed
-
-    def _ocr_roi(self, reader, frame, frame_no, roi):
-        """Run OCR only in an expanded crop around a tracked target and map boxes back."""
-        h, w = frame.shape[:2]
-        x, y, rw, rh = self._clip(frame, roi)
-        # Expand crop to tolerate small tracker drift and changes in text size.
-        pad_x = max(12, int(rw * 0.75))
-        pad_y = max(12, int(rh * 1.00))
-        x1 = max(0, x - pad_x)
-        y1 = max(0, y - pad_y)
-        x2 = min(w, x + rw + pad_x)
-        y2 = min(h, y + rh + pad_y)
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return [], 0.0
-        detections, elapsed = self._ocr_all(
-            reader, crop, frame_no, canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
-        mapped = []
-        for box, text, confidence in detections:
-            bx, by, bw, bh = box
-            mapped.append((self._clip(frame, (bx + x1, by + y1, bw, bh)), text, confidence))
-        # De-duplicate overlapping detections from nearby ROI crops.
-        mapped.sort(key=lambda item: item[2], reverse=True)
-        unique = []
-        for item in mapped:
-            if not any(self._iou(item[0], old[0]) > 0.82 for old in unique):
-                unique.append(item)
-        self._report("ocr_done", f"ROI OCR 完成，耗時 {elapsed:.2f} 秒；符合目標 {len(unique)} 個",
-                     frame_no, elapsed_seconds=elapsed, target_count=len(unique), ocr_mode="roi")
-        return unique, elapsed
-
-    @staticmethod
-    def _appearance_signature(frame, roi):
-        """A cheap visual fingerprint. It is supporting evidence, never identity proof."""
-        x, y, w, h = [int(v) for v in roi]
-        fh, fw = frame.shape[:2]
-        x, y = max(0, min(x, fw-1)), max(0, min(y, fh-1))
-        w, h = max(1, min(w, fw-x)), max(1, min(h, fh-y))
+    def _gray_template(frame, roi):
+        x, y, w, h = roi
         crop = frame[y:y+h, x:x+w]
         if crop.size == 0:
             return None
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (32, 16), interpolation=cv2.INTER_AREA)
-        # Normalize brightness to reduce sensitivity to mild lighting changes.
+        # Equalization makes the reference somewhat less sensitive to mild lighting shifts.
         gray = cv2.equalizeHist(gray)
         return gray
 
     @staticmethod
-    def _appearance_similarity(a, b):
-        if a is None or b is None or a.shape != b.shape:
+    def _patch_score(template, frame, roi):
+        """Compare the current ROI to the initial template at a fixed template size."""
+        if template is None:
             return 0.0
-        diff = float(np.mean(cv2.absdiff(a, b))) / 255.0
-        return max(0.0, min(1.0, 1.0 - diff))
+        x, y, w, h = roi
+        crop = frame[y:y+h, x:x+w]
+        if crop.size == 0 or w < 3 or h < 3:
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (template.shape[1], template.shape[0]),
+                          interpolation=cv2.INTER_AREA if w >= template.shape[1] else cv2.INTER_LINEAR)
+        gray = cv2.equalizeHist(gray)
+        try:
+            score = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)[0, 0]
+            if not np.isfinite(score):
+                return 0.0
+            return float(max(-1.0, min(1.0, score)))
+        except cv2.error:
+            return 0.0
 
-    def _new_track(self, frame, detection, track_id, frame_no=0):
-        roi, text, confidence = detection
-        tracker = self._create_tracker()
-        tracker.init(frame, roi)
-        center = self._center(roi)
-        return {"id": track_id, "tracker": tracker, "roi": roi, "lost": 0,
-                "text": text, "confidence": confidence, "state": "OCR_CONFIRMED",
-                "appearance": self._appearance_signature(frame, roi),
-                "center": center, "speed": 0.0, "last_seen_frame": int(frame_no)}
+    def _template_search(self, frame, last_roi, template):
+        """Exhaustive full-resolution template search over every valid location.
 
-    def _associate_detections(self, frame, detections, tracks, frame_no):
-        """Conservative one-to-one matching; never attach a distant new detection by nearest-neighbour alone."""
-        pairs = []
-        for tid, track in tracks.items():
-            if track["lost"] > self.MAX_PREDICTED_GAP:
+        No frame downscaling and no local-only refinement: for each configured
+        template scale, cv2.matchTemplate evaluates all legal placements across
+        the entire original-resolution frame. OpenCV performs the sliding
+        comparison in optimized native code (rather than a Python pixel loop).
+        """
+        if template is None:
+            return None, 0.0
+        fh, fw = frame.shape[:2]
+        th, tw = template.shape[:2]
+        if th < 3 or tw < 3:
+            return None, 0.0
+
+        # Convert the whole frame only once per frame; all pixel locations are
+        # still searched at the original resolution.
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_gray = cv2.equalizeHist(frame_gray)
+        best_roi, best_score = None, -1.0
+
+        for scale in self.TEMPLATE_SCALES:
+            sw = max(3, int(round(tw * scale)))
+            sh = max(3, int(round(th * scale)))
+            if sw > fw or sh > fh:
                 continue
-            old_roi = track["roi"]
-            old_center = self._center(old_roi)
-            diag = max(20.0, math.hypot(old_roi[2], old_roi[3]))
-            age = max(1, int(frame_no) - int(track.get("last_seen_frame", frame_no-1)))
-            gate = max(45.0, diag * 1.25 + float(track.get("speed", 0.0)) * min(age, 8) * 1.5)
-            for di, det in enumerate(detections):
-                roi = det[0]
-                center = self._center(roi)
-                dist = math.hypot(center[0]-old_center[0], center[1]-old_center[1])
-                if dist > gate:
-                    continue
-                iou = self._iou(old_roi, roi)
-                sig = self._appearance_signature(frame, roi)
-                appearance = self._appearance_similarity(track.get("appearance"), sig)
-                # A plausible position match is required; appearance alone cannot reconnect a target.
-                if iou < 0.02 and dist > max(24.0, diag * 0.55) and appearance < 0.48:
-                    continue
-                proximity = max(0.0, 1.0 - dist / max(1.0, gate))
-                score = 0.40 * proximity + 0.35 * iou + 0.25 * appearance
-                if score >= self.MATCH_MIN_SCORE:
-                    pairs.append((score, tid, di))
-        pairs.sort(reverse=True)
-        used_tracks, used_detections, matches = set(), set(), []
-        for score, tid, di in pairs:
-            if tid in used_tracks or di in used_detections:
-                continue
-            used_tracks.add(tid); used_detections.add(di)
-            matches.append((tid, di, score))
-        return matches, used_detections
-
-    def _draw_monitor(self, frame, frame_no, rois, mode):
-        """Green=OCR confirmed, cyan=per-frame tracker, yellow=lost/rejected; only eligible boxes are mosaiced."""
-        shown = frame.copy()
-        color_by_state = {"OCR_CONFIRMED": (0, 220, 0), "TRACKING": (255, 210, 0),
-                          "LOST": (0, 190, 255), "JUMP_REJECTED": (0, 0, 255)}
-        for item in rois:
-            if len(item) == 2:
-                track_id, roi = item; state = "TRACKING"; confidence = None
+            if sw == tw and sh == th:
+                candidate_template = template
             else:
-                track_id, roi, state, confidence = item
-            x, y, w, h = [int(v) for v in roi]
-            color = color_by_state.get(state, (255, 255, 255))
+                candidate_template = cv2.resize(
+                    template, (sw, sh),
+                    interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                )
+            # This response map covers every possible (x, y) placement in the
+            # full-resolution frame for this template size.
+            response = cv2.matchTemplate(
+                frame_gray, candidate_template, cv2.TM_CCOEFF_NORMED
+            )
+            _, max_val, _, max_loc = cv2.minMaxLoc(response)
+            if np.isfinite(max_val) and max_val > best_score:
+                best_score = float(max_val)
+                best_roi = self._clip(frame, (max_loc[0], max_loc[1], sw, sh))
+
+        if best_roi is None:
+            return None, 0.0
+        return best_roi, max(0.0, best_score)
+
+    @staticmethod
+    def _normalize(text):
+        return "".join(ch for ch in str(text).casefold() if ch.isalnum())
+
+    def _ocr_recover_local(self, frame, roi, reader):
+        """Optional OCR recovery in a bounded local region, never an unconditional full-frame scan."""
+        if not self.target_text:
+            return None, reader
+        try:
+            import easyocr
+            if reader is None:
+                reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
+            fh, fw = frame.shape[:2]
+            x, y, w, h = roi
+            pad_x, pad_y = max(w, 30), max(h, 20)
+            x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+            x2, y2 = min(fw, x + w + pad_x), min(fh, y + h + pad_y)
+            crop = frame[y1:y2, x1:x2]
+            target = self._normalize(self.target_text)
+            if crop.size == 0:
+                return None, reader
+            results = reader.readtext(crop, detail=1, paragraph=False, decoder="greedy",
+                                      canvas_size=640, min_size=8)
+            best = None
+            best_conf = 0.0
+            for item in results or []:
+                if len(item) < 3:
+                    continue
+                text, conf = str(item[1]), float(item[2])
+                if target not in self._normalize(text) or conf < 0.20:
+                    continue
+                pts = np.asarray(item[0], dtype=np.float32).reshape(-1, 2)
+                bx1, by1 = pts.min(axis=0)
+                bx2, by2 = pts.max(axis=0)
+                bw, bh = bx2 - bx1, by2 - by1
+                pad_w, pad_h = max(2, int(bw * 0.15)), max(2, int(bh * 0.25))
+                candidate = self._clip(frame, (x1 + bx1 - pad_w, y1 + by1 - pad_h,
+                                                bw + 2 * pad_w, bh + 2 * pad_h))
+                # Do not let OCR jump to a far-away duplicate occurrence.
+                old_c, new_c = self._center(roi), self._center(candidate)
+                diag = max(20.0, math.hypot(w, h))
+                if math.hypot(old_c[0] - new_c[0], old_c[1] - new_c[1]) > diag * 3.0:
+                    continue
+                if conf > best_conf:
+                    best, best_conf = candidate, conf
+            return best, reader
+        except Exception as exc:
+            self._report("ocr_recovery_error", f"OCR 補救失敗：{type(exc).__name__}: {exc}")
+            return None, reader
+
+    def _draw_monitor(self, frame, frame_no, roi, state, score, tracker_label):
+        shown = frame.copy()
+        if roi is not None:
+            x, y, w, h = roi
+            colors = {
+                "INITIAL": (0, 220, 0),
+                "TRACKING": (255, 210, 0),
+                "TEMPLATE_RECOVERED": (0, 220, 220),
+                "TEMPLATE_MATCHED": (0, 220, 220),
+                "OCR_RECOVERED": (0, 220, 0),
+                "UNCERTAIN": (0, 0, 255),
+                "LOST": (0, 0, 255),
+            }
+            color = colors.get(state, (255, 255, 255))
             cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
-            label = f"ID {track_id} {state}"
-            if confidence is not None:
-                label += f" {float(confidence):.2f}"
-            cv2.putText(shown, label, (x, max(18, y-5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
-        cv2.putText(shown, f"Frame {frame_no} | {mode} | maskable={sum(1 for r in rois if len(r) >= 3 and r[2] in ('OCR_CONFIRMED','TRACKING'))}", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
-        # Legend is burned into the monitor preview only, not the exported video.
-        cv2.putText(shown, "GREEN OCR | CYAN tracked | YELLOW lost | RED motion jump rejected",
-                    (12, 53), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        self.monitor_frame_signal.emit(shown, int(frame_no), mode)
+            cv2.putText(shown, f"{state} score={score:.2f}", (x, max(18, y-7)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        cv2.putText(shown, f"F{frame_no} | {tracker_label}", (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        self.monitor_frame_signal.emit(shown, int(frame_no), state)
 
     def run(self):
         cap = None
         data = {}
         last_frame = self.start_frame
         success = False
+        cancelled = False
+        reader = None
         try:
-            self.progress_signal.emit(self.start_frame, "正在載入 OCR 與外觀/運動關聯...")
-            self._report("loading", "正在載入 EasyOCR；啟用保守的逐幀追蹤關聯", self.start_frame)
-            reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
-            gate = GlobalFeatureGate()
+            if self.initial_roi is None or len(self.initial_roi) != 4 or self.initial_roi[2] <= 0 or self.initial_roi[3] <= 0:
+                raise RuntimeError("缺少有效的手動初始框。請在預覽影格中手動框選目標。")
+
+            self.progress_signal.emit(self.start_frame, "正在載入影片並初始化全畫面比對...")
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError("無法開啟影片檔案。")
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
-            ret, frame = cap.read()
-            if not ret:
-                raise RuntimeError("無法讀取起始影格。")
+            ok, first_frame = cap.read()
+            if not ok:
+                raise RuntimeError(f"無法讀取起始影格 F{self.start_frame}。")
 
-            # We do not force detections onto ByteTrack IDs. A conservative one-to-one
-            # association below uses motion gating, overlap and a lightweight appearance signature.
+            roi = self._clip(first_frame, self.initial_roi)
+            x, y, w, h = roi
+            if w < 5 or h < 5:
+                raise RuntimeError("初始框太小，請重新框選較完整的目標。")
+            template = self._gray_template(first_frame, roi)
+            # Intentionally do not use KCF/MOSSE to determine the final box.
+            # Those trackers are local and can drift when the target moves.
+            tracker_label = "GLOBAL_TEMPLATE_MATCH"
+            self._report("initialized", f"手動初始框完成；追蹤器={tracker_label}",
+                         self.start_frame, bbox=roi, tracker=tracker_label)
+            data[self.start_frame] = [roi]
+            current_roi = roi
+            last_valid_roi = roi
+            lost_count = 0
+            last_ocr_attempt = -10**9
+            last_frame = self.start_frame
+            self._draw_monitor(first_frame, self.start_frame, roi, "INITIAL", 1.0, tracker_label)
 
-            # Phase 1: fast coarse search. OCR runs on a resized image every few frames,
-            # instead of spending a full-resolution OCR pass on every empty frame.
-            hit_frame_no = None
-            search_frame_no = self.start_frame
-            while search_frame_no < self.total_frames:
-                if self.isInterruptionRequested():
-                    self._report("cancelled", "使用者取消搜尋目標", search_frame_no)
-                    return
-                if search_frame_no != self.start_frame:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, search_frame_no)
-                    ret, frame = cap.read()
-                if not ret:
-                    break
-                original_frame = frame
-                fh, fw = frame.shape[:2]
-                scale = min(1.0, self.SEARCH_MAX_DIM / float(max(fh, fw)))
-                if scale < 1.0:
-                    search_img = cv2.resize(frame, (max(1, int(round(fw*scale))),
-                                                    max(1, int(round(fh*scale)))),
-                                            interpolation=cv2.INTER_AREA)
-                else:
-                    search_img = frame
-                detections, _ = self._ocr_all(
-                    reader, search_img, search_frame_no,
-                    coordinate_frame=original_frame,
-                    canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
-                if detections:
-                    gate.report_search_result(True)
-                    hit_frame_no = search_frame_no
-                    self._report("search_hit", f"快速搜尋在第 {hit_frame_no} 幀找到目標，正在高畫質初始化多目標…",
-                                 hit_frame_no, target_count=len(detections))
-                    break
-                self._report("searching", f"快速搜尋中：F{search_frame_no}/{self.total_frames}，尚未找到「{self.target_text}」",
-                             search_frame_no, target_text=self.target_text)
-                self.progress_signal.emit(search_frame_no,
-                    f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
-                gate.report_search_result(False)
-                search_frame_no += gate.search_interval()
-                ret = True
-
-            if hit_frame_no is None:
-                self._report("not_found", f"從起始影格到影片結尾都找不到目標文字：{self.target_text}",
-                             max(self.start_frame, min(search_frame_no, self.total_frames-1)))
-                return
-
-            # Phase 2: full-resolution burst scan around the first hit. This is what
-            # prevents initialization from stopping after the first detected instance.
-            burst_start = max(self.start_frame, hit_frame_no - self.INIT_BURST_BEFORE)
-            burst_end = min(self.total_frames - 1, hit_frame_no + self.INIT_BURST_AFTER)
-            burst_cache = {}
-            burst_frames = {}
-            cap.set(cv2.CAP_PROP_POS_FRAMES, burst_start)
-            for burst_no in range(burst_start, burst_end + 1):
-                if self.isInterruptionRequested():
-                    self._report("cancelled", "使用者取消多目標初始化", burst_no)
-                    return
-                ret, burst_frame = cap.read()
-                if not ret:
-                    break
-                burst_frames[burst_no] = burst_frame
-                burst_cache[burst_no], _ = self._ocr_all(
-                    reader, burst_frame, burst_no,
-                    canvas_size=self.DETECT_CANVAS_SIZE, report=True)
-
-            detected_burst_frames = [n for n, dets in burst_cache.items() if dets]
-            if not detected_burst_frames:
-                self._report("searching", "快速搜尋命中後，高畫質複查未確認目標；繼續向後搜尋…", hit_frame_no)
-                # Avoid treating a low-resolution false positive as a locked target.
-                search_frame_no = burst_end + 1
-                ret = True
-                while search_frame_no < self.total_frames:
-                    if self.isInterruptionRequested():
-                        self._report("cancelled", "使用者取消搜尋目標", search_frame_no)
-                        return
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, search_frame_no)
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    fh, fw = frame.shape[:2]
-                    scale = min(1.0, self.SEARCH_MAX_DIM / float(max(fh, fw)))
-                    search_img = cv2.resize(frame, (max(1, int(round(fw*scale))), max(1, int(round(fh*scale)))), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
-                    detections, _ = self._ocr_all(reader, search_img, search_frame_no, coordinate_frame=frame, canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
-                    if detections:
-                        gate.report_search_result(True)
-                        hit_frame_no = search_frame_no
-                        burst_start = max(self.start_frame, hit_frame_no-self.INIT_BURST_BEFORE)
-                        burst_end = min(self.total_frames-1, hit_frame_no+self.INIT_BURST_AFTER)
-                        burst_cache.clear(); burst_frames.clear()
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, burst_start)
-                        for burst_no in range(burst_start, burst_end+1):
-                            ret, burst_frame = cap.read()
-                            if not ret: break
-                            burst_frames[burst_no] = burst_frame
-                            burst_cache[burst_no], _ = self._ocr_all(reader, burst_frame, burst_no, canvas_size=self.DETECT_CANVAS_SIZE, report=True)
-                        detected_burst_frames = [n for n, dets in burst_cache.items() if dets]
-                        if detected_burst_frames:
-                            break
-                    self.progress_signal.emit(search_frame_no, f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
-                    gate.report_search_result(False)
-                    search_frame_no += gate.search_interval()
-                if not detected_burst_frames:
-                    self._report("not_found", f"從起始影格到影片結尾都找不到可確認的目標文字：{self.target_text}",
-                                 max(self.start_frame, min(search_frame_no, self.total_frames-1)))
-                    return
-
-            # Start live trackers on the latest burst frame with confirmed detections.
-            # Earlier burst detections are retained for immediate frame-accurate mosaicing.
-            initial_frame_no = max(detected_burst_frames)
-            frame = burst_frames[initial_frame_no]
-            detections = burst_cache[initial_frame_no]
-            tracks = {}
-            next_track_id = 1
-            for detection in detections:
-                # Every distinct OCR box starts as its own track; no path is inferred between boxes.
-                if any(self._iou(detection[0], t["roi"]) >= 0.80 for t in tracks.values()):
-                    continue
-                tracks[next_track_id] = self._new_track(frame, detection, next_track_id, initial_frame_no)
-                next_track_id += 1
-
-            # Save direct OCR boxes for every frame in the initialization burst. This gives
-            # the export an immediate mask even when CSRT's first update would be imperfect.
-            for burst_no, burst_dets in burst_cache.items():
-                data[burst_no] = [tuple(map(int, d[0])) for d in burst_dets]
-            cap.set(cv2.CAP_PROP_POS_FRAMES, initial_frame_no + 1)
-            ret = True
-
-            def record_frame(frame_no, current_frame):
-                rois = []
-                draw = []
-                for tid, t in list(tracks.items()):
-                    if t["lost"] > self.MAX_PREDICTED_GAP:
-                        continue
-                    roi = tuple(map(int, self._clip(current_frame, t["roi"])))
-                    state = t.get("state", "TRACKING")
-                    # Important: only a valid per-frame tracker update or direct OCR confirmation
-                    # contributes a mask. A stale box is drawn as LOST for diagnostics, never masked.
-                    draw_state = "JUMP_REJECTED" if state == "JUMP_REJECTED" else (state if t["lost"] == 0 else "LOST")
-                    draw.append((tid, roi, draw_state, t.get("confidence")))
-                    if t["lost"] != 0 or state in ("LOST", "JUMP_REJECTED"):
-                        continue
-                    if not any(self._iou(roi, old) > 0.88 for old in rois):
-                        rois.append(roi)
-                # OCR detections in the initialization burst are direct observations and are masked
-                # on their own frames only. This does not create any interpolated path.
-                for detection in burst_cache.get(frame_no, []):
-                    roi = tuple(map(int, self._clip(current_frame, detection[0])))
-                    if not any(self._iou(roi, old) > 0.88 for old in rois):
-                        rois.append(roi)
-                data[frame_no] = rois
-                return draw
-
-            data[initial_frame_no] = [tuple(map(int, d[0])) for d in detections]
-            initial = [(tid, t["roi"], "OCR_CONFIRMED", t.get("confidence")) for tid, t in tracks.items()]
-            self._draw_monitor(frame, initial_frame_no, initial, "OCR INITIALIZATION")
-            self._report("locked", f"高畫質初始化完成：第 {initial_frame_no} 幀有 {len(detections)} 個目標區域，建立 {len(tracks)} 個追蹤 ID",
-                         initial_frame_no, target_text=self.target_text, target_count=len(detections), tracked_frames=len(burst_cache))
-            self.progress_signal.emit(initial_frame_no,
-                f"初始化找到 {len(detections)} 個目標，開始追蹤")
-            last_frame = initial_frame_no
-            stop_reason = "已處理至影片結尾"
-
-            for i in range(initial_frame_no + 1, self.total_frames):
-                if self.isInterruptionRequested():
-                    stop_reason = "使用者取消追蹤"
+            frame_no = self.start_frame + 1
+            while True:
+                if self.isInterruptionRequested() or self._cancelled:
+                    cancelled = True
+                    self._report("cancelled", "使用者取消追蹤", last_frame)
                     break
                 ret, frame = cap.read()
                 if not ret:
-                    stop_reason = "影片讀取結束或讀取失敗"
                     break
-                last_frame = i
+                last_frame = frame_no
+                frame_started = time.monotonic()
+                # Primary method: exhaustive 2D template search on EVERY frame.
+                # No KCF box is accepted as the answer; this searches all valid x/y
+                # placements in the original-resolution frame at each configured scale.
+                found, match_score = self._template_search(frame, last_valid_roi, template)
+                candidate = None
+                score = match_score
+                state = "LOST"
 
-                # Update every frame. Reject implausibly large CSRT jumps instead of
-                # letting the box teleport to another similar-looking object.
-                for t in tracks.values():
-                    # Once a tracker is lost or a jump was rejected, do not let CSRT
-                    # silently declare itself recovered. Only a later OCR association may
-                    # re-lock the ID; this avoids masking a different object after drift.
-                    if t["lost"] > 0:
-                        t["lost"] += 1
-                        if t.get("state") != "JUMP_REJECTED":
-                            t["state"] = "LOST"
-                        continue
-                    previous_roi = t["roi"]
-                    previous_center = self._center(previous_roi)
-                    ok, bbox = t["tracker"].update(frame) if t.get("tracker") is not None else (False, previous_roi)
-                    if ok and bbox[2] > 1 and bbox[3] > 1:
-                        candidate_roi = self._clip(frame, bbox)
-                        candidate_center = self._center(candidate_roi)
-                        distance = math.hypot(candidate_center[0]-previous_center[0], candidate_center[1]-previous_center[1])
-                        diag = max(20.0, math.hypot(previous_roi[2], previous_roi[3]))
-                        max_step = max(35.0, diag * self.MOTION_JUMP_DIAGONALS)
-                        if distance <= max_step:
-                            t["speed"] = 0.70 * float(t.get("speed", 0.0)) + 0.30 * distance
-                            t["roi"] = candidate_roi
-                            t["center"] = candidate_center
-                            t["lost"] = 0
-                            t["state"] = "TRACKING"
-                        else:
-                            t["lost"] += 1
-                            t["state"] = "JUMP_REJECTED"
-                    else:
-                        t["lost"] += 1
-                        t["state"] = "LOST"
+                if found is not None and match_score >= self.MIN_TEMPLATE_SCORE:
+                    candidate = self._clip(frame, found)
+                    state = "TEMPLATE_MATCHED"
+                    lost_count = 0
 
-                active_tracks = [t for t in tracks.values() if t["lost"] <= self.MAX_PREDICTED_GAP]
-                has_uncertain_track = any(t["lost"] > 0 for t in active_tracks)
-                decision = gate.decide_tracking(i, active_tracks, has_uncertain_track)
-                should_ocr = (i in burst_cache) or decision.run_ocr
-                elapsed = 0.0
-                if should_ocr:
-                    if i in burst_cache:
-                        detections = burst_cache[i]
-                    elif decision.mode == "roi" and active_tracks:
-                        detections = []
-                        for track in active_tracks:
-                            if track["lost"] != 0:
-                                continue
-                            roi_dets, roi_elapsed = self._ocr_roi(reader, frame, i, track["roi"])
-                            elapsed += roi_elapsed
-                            for det in roi_dets:
-                                if not any(self._iou(det[0], old[0]) > 0.82 for old in detections):
-                                    detections.append(det)
-                    else:
-                        detections, elapsed = self._ocr_all(reader, frame, i)
-                        gate.note_full_scan(i)
-                    matches, used_detection_indices = self._associate_detections(frame, detections, tracks, i)
-                    for tid, di, match_score in matches:
-                        detection = detections[di]
-                        roi, text, conf = detection
-                        t = tracks[tid]
-                        t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf,
-                                  "state": "OCR_CONFIRMED", "last_seen_frame": i,
-                                  "center": self._center(roi)})
-                        # Keep the original appearance template stable; do not learn from uncertain matches.
-                        t["tracker"] = self._create_tracker()
-                        t["tracker"].init(frame, roi)
+                if candidate is None:
+                    lost_count += 1
+                    # OCR is a rare fallback, gated by cooldown and only if a target string exists.
+                    if (self.target_text and frame_no - last_ocr_attempt >= self.OCR_RETRY_COOLDOWN):
+                        last_ocr_attempt = frame_no
+                        self._report("ocr_recovery", f"追蹤信心不足，局部 OCR 補救中 (F{frame_no})",
+                                     frame_no, score=match_score)
+                        ocr_roi, reader = self._ocr_recover_local(frame, last_valid_roi, reader)
+                        if ocr_roi is not None:
+                            candidate = ocr_roi
+                            score = 0.75
+                            state = "OCR_RECOVERED"
+                            tracker_label = "GLOBAL_TEMPLATE_MATCH+OCR"
+                            lost_count = 0
+                    if candidate is None and lost_count <= self.STALE_GRACE_FRAMES:
+                        # Brief grace period only; old coordinates are not silently written
+                        # for an extended run of frames.
+                        candidate = last_valid_roi
+                        state = "UNCERTAIN"
+                        score = 0.0
 
-                    # Unmatched detections start new IDs instead of being attached to the nearest
-                    # existing track by position alone. This prevents a far-away duplicate from
-                    # being treated as the same moving object.
-                    for di, detection in enumerate(detections):
-                        if di in used_detection_indices:
-                            continue
-                        if any(self._iou(detection[0], t["roi"]) > 0.82 for t in tracks.values() if t["lost"] == 0):
-                            continue
-                        tracks[next_track_id] = self._new_track(frame, detection, next_track_id, i)
-                        next_track_id += 1
+                if candidate is not None and state != "UNCERTAIN":
+                    current_roi = candidate
+                    last_valid_roi = candidate
+                    data[frame_no] = [candidate]
+                elif candidate is not None and state == "UNCERTAIN":
+                    # Conservative short grace period to reduce a one-frame gap.
+                    data[frame_no] = [candidate]
+                else:
+                    # Do not reuse stale boxes indefinitely: that can mosaic the wrong location.
+                    data[frame_no] = []
 
-                    # Keep briefly lost tracks available for conservative re-identification,
-                    # but never use their stale box as a mosaic ROI.
-                    tracks = {tid: t for tid, t in tracks.items() if t["lost"] <= self.MAX_PREDICTED_GAP}
-                    self._report("tracking", f"外觀/運動關聯完成：OCR 偵測 {len(detections)} 個，追蹤 ID {len(tracks)} 個",
-                                 i, target_count=len(tracks), elapsed_seconds=elapsed,
-                                 ocr_mode=(decision.mode if should_ocr else "skipped"),
-                                 ocr_reason=(decision.reason if should_ocr else "gate skipped redundant OCR"),
-                                 lost_count=sum(t["lost"] > 0 for t in tracks.values()),
-                                 patience=self.MAX_PREDICTED_GAP, detection_count=len(detections))
+                if frame_no % self.MONITOR_INTERVAL == 0:
+                    self._draw_monitor(frame, frame_no, candidate, state, score, tracker_label)
+                if frame_no % self.PROGRESS_INTERVAL == 0:
+                    elapsed = time.monotonic() - frame_started
+                    self.progress_signal.emit(frame_no, f"追蹤 F{frame_no}/{self.total_frames} | {state} | {elapsed:.3f}s/frame")
+                    self._report("tracking", f"F{frame_no}/{self.total_frames} | {state}",
+                                 frame_no, tracker=tracker_label, score=score,
+                                 lost_count=lost_count, frame_elapsed_seconds=elapsed)
+                frame_no += 1
 
-                rois_with_ids = record_frame(i, frame)
-                if i % self.MONITOR_INTERVAL == 0:
-                    mode = "OCR CONFIRMED + CSRT" if any(t["lost"] == 0 for t in tracks.values()) else "SEARCHING / LOST"
-                    self._draw_monitor(frame, i, rois_with_ids, mode)
-                    self.progress_signal.emit(i, f"追蹤 F{i}/{self.total_frames}，可遮罩框 {len(data.get(i, []))}")
-
-            success = bool(data)
-            self._report("finished", stop_reason, last_frame, tracked_frames=len(data),
-                         target_count=max((len(v) for v in data.values()), default=0), success=success)
+            success = (not cancelled) and bool(data) and any(bool(v) for v in data.values())
+            self._report("finished", "追蹤完成" if success else ("追蹤已取消" if cancelled else "未取得追蹤資料"),
+                         last_frame, tracked_frames=sum(bool(v) for v in data.values()),
+                         total_frames=len(data), tracker=tracker_label, success=success)
         except Exception as exc:
             self._report("error", f"執行錯誤：{type(exc).__name__}: {exc}", last_frame)
-            success = bool(data)
+            success = (not cancelled) and bool(data) and any(bool(v) for v in data.values())
         finally:
             if cap is not None:
                 cap.release()
@@ -572,26 +380,33 @@ class OCRTrackingThread(QThread):
 
 
 class VideoProcessorThread(QThread):
+    """Frame-accurate mosaic exporter; compatible with the existing GUI task format."""
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(str)
 
     def __init__(self, video_path, output_path, mosaic_tasks):
         super().__init__()
-        self.video_path, self.output_path, self.mosaic_tasks = video_path, output_path, mosaic_tasks
+        self.video_path = video_path
+        self.output_path = output_path
+        self.mosaic_tasks = mosaic_tasks
 
     @staticmethod
     def _apply_mosaic(frame, roi, strength):
         height, width = frame.shape[:2]
         x, y, w, h = [int(round(float(v))) for v in roi]
-        x = max(0, min(x, width - 1)); y = max(0, min(y, height - 1))
-        w = max(0, min(w, width - x)); h = max(0, min(h, height - y))
+        x = max(0, min(x, width - 1))
+        y = max(0, min(y, height - 1))
+        w = max(0, min(w, width - x))
+        h = max(0, min(h, height - y))
         if w <= 0 or h <= 0:
             return
         area = frame[y:y+h, x:x+w]
         strength = max(1, int(strength))
         sw, sh = max(1, w // strength), max(1, h // strength)
-        frame[y:y+h, x:x+w] = cv2.resize(cv2.resize(area, (sw, sh), interpolation=cv2.INTER_LINEAR),
-                                           (w, h), interpolation=cv2.INTER_NEAREST)
+        frame[y:y+h, x:x+w] = cv2.resize(
+            cv2.resize(area, (sw, sh), interpolation=cv2.INTER_LINEAR),
+            (w, h), interpolation=cv2.INTER_NEAREST
+        )
 
     @staticmethod
     def _rois_for_frame(task, frame_no):
@@ -601,23 +416,34 @@ class VideoProcessorThread(QThread):
         value = task.get("tracking_data", {}).get(frame_no)
         if value is None:
             return []
-        if isinstance(value, (tuple, list)) and len(value) == 4 and all(isinstance(v, (int, float)) for v in value):
+        if isinstance(value, (tuple, list)) and len(value) == 4 and all(
+                isinstance(v, (int, float)) for v in value):
             return [value]
         return list(value) if isinstance(value, (list, tuple)) else []
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            self.finished_signal.emit(""); return
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.finished_signal.emit("")
+            return
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        out = cv2.VideoWriter(
+            self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
         if not out.isOpened():
-            cap.release(); self.finished_signal.emit(""); return
+            cap.release()
+            self.finished_signal.emit("")
+            return
         current = 0
+        ok_output = True
         try:
             while True:
+                if self.isInterruptionRequested():
+                    ok_output = False
+                    break
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -631,7 +457,8 @@ class VideoProcessorThread(QThread):
                     self.progress_signal.emit(current, total)
             self.progress_signal.emit(current, total)
         except Exception:
-            self.finished_signal.emit(""); return
+            ok_output = False
         finally:
-            cap.release(); out.release()
-        self.finished_signal.emit(self.output_path)
+            cap.release()
+            out.release()
+        self.finished_signal.emit(self.output_path if ok_output and current > 0 else "")
