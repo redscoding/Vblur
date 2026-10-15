@@ -7,6 +7,11 @@ import math
 import time
 import cv2
 import easyocr
+import numpy as np
+try:
+    import supervision as sv
+except ImportError:
+    sv = None
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
@@ -16,9 +21,19 @@ class OCRTrackingThread(QThread):
     monitor_frame_signal = pyqtSignal(object, int, str)
     monitor_data_signal = pyqtSignal(dict)
 
-    OCR_INTERVAL = 12
+    # OCR/ByteTrack association runs periodically; CSRT propagates boxes between detections.
+    # Search is deliberately cheaper than steady-state tracking. A coarse search can
+    # miss a target that appears for fewer than SEARCH_STEP frames; the full-resolution
+    # burst after the first hit compensates for initialization misses around that point.
+    SEARCH_STEP = 3
+    SEARCH_MAX_DIM = 960
+    SEARCH_CANVAS_SIZE = 1280
+    INIT_BURST_BEFORE = 2
+    INIT_BURST_AFTER = 5
+    OCR_INTERVAL = 6
+    ADAPTIVE_OCR_INTERVAL = 2
     MIN_CONFIDENCE = 0.20
-    MAX_PREDICTED_GAP = 4
+    MAX_PREDICTED_GAP = 10
     DETECT_CANVAS_SIZE = 1920
 
     def __init__(self, video_path, start_frame, total_frames, target_text):
@@ -66,84 +81,67 @@ class OCRTrackingThread(QThread):
         # Case-insensitive; ignore whitespace and common punctuation but preserve letters/numbers.
         return "".join(ch for ch in str(text).casefold() if ch.isalnum())
 
-    def _ocr_all(self, reader, frame, frame_no):
-        """Detect text boxes first, then recognize each detector box independently.
+    def _ocr_all(self, reader, frame, frame_no, *, coordinate_frame=None,
+                 canvas_size=None, report=True):
+        """Detect every occurrence of the requested text in one EasyOCR pass.
 
-        Calling readtext() on a full image may group nearby text boxes before recognition.
-        detect()+recognize() makes the detector's boxes explicit and avoids relying on
-        a single returned text line to represent all instances.
+        `frame` may be a downscaled search image. If `coordinate_frame` is supplied,
+        boxes are mapped back to that original frame's coordinate system.
         """
         started = time.monotonic()
         target = self._normalize(self.target_text)
-        h, w = frame.shape[:2]
         found = []
         raw_texts = []
         try:
-            horizontal_batch, free_batch = reader.detect(
-                frame, min_size=8, text_threshold=0.6, low_text=0.35,
-                link_threshold=0.35, canvas_size=self.DETECT_CANVAS_SIZE,
+            results = reader.readtext(
+                frame, detail=1, paragraph=False, decoder="greedy",
+                min_size=8, text_threshold=0.6, low_text=0.35,
+                link_threshold=0.35, canvas_size=int(canvas_size or self.DETECT_CANVAS_SIZE),
                 mag_ratio=1.0, slope_ths=0.1, ycenter_ths=0.35,
                 height_ths=0.35, width_ths=0.1, add_margin=0.05,
-                reformat=True)
-            horizontal = horizontal_batch[0] if horizontal_batch else []
-            free = free_batch[0] if free_batch else []
-            # Recognize each detector result separately. This prevents one recognition
-            # result from hiding another independent occurrence of the target.
-            boxes = []
-            for box in horizontal:
-                if len(box) >= 4:
-                    x1, x2, y1, y2 = [int(round(float(v))) for v in box[:4]]
-                    boxes.append((max(0, x1), max(0, y1), min(w, x2), min(h, y2), None))
-            for poly in free:
-                pts = poly.tolist() if hasattr(poly, "tolist") else poly
-                xs = [float(p[0]) for p in pts]; ys = [float(p[1]) for p in pts]
-                boxes.append((max(0, int(min(xs))), max(0, int(min(ys))),
-                              min(w, int(max(xs))), min(h, int(max(ys))), pts))
-
-            for x1, y1, x2, y2, poly in boxes:
-                if x2 <= x1 or y2 <= y1:
+                batch_size=16, workers=0,
+            )
+            h, w = frame.shape[:2]
+            if coordinate_frame is not None:
+                oh, ow = coordinate_frame.shape[:2]
+                sx, sy = ow / float(w), oh / float(h)
+                clip_frame = coordinate_frame
+            else:
+                sx = sy = 1.0
+                clip_frame = frame
+            for item in results or []:
+                if len(item) < 3:
                     continue
-                try:
-                    if poly is None:
-                        rec = reader.recognize(frame, horizontal_list=[[x1, x2, y1, y2]],
-                                               free_list=[], detail=1, paragraph=False,
-                                               decoder="greedy", batch_size=1, workers=0)
-                    else:
-                        rec = reader.recognize(frame, horizontal_list=[], free_list=[poly],
-                                               detail=1, paragraph=False, decoder="greedy",
-                                               batch_size=1, workers=0)
-                except Exception:
-                    # Fallback for EasyOCR versions with different recognize signatures.
-                    crop = frame[y1:y2, x1:x2]
-                    rec = reader.readtext(crop, detail=1, paragraph=False,
-                                          decoder="greedy", width_ths=0.1, ycenter_ths=0.1)
-                if not rec:
+                points, text, confidence = item[0], str(item[1]), float(item[2])
+                if report:
+                    raw_texts.append({"text": text, "confidence": confidence})
+                if confidence < self.MIN_CONFIDENCE or not target or target not in self._normalize(text):
                     continue
-                # One detector box is recognized at a time; use its best text result.
-                best = max(rec, key=lambda r: float(r[2]) if len(r) > 2 else 0.0)
-                text = str(best[1]) if len(best) > 1 else ""
-                conf = float(best[2]) if len(best) > 2 else 0.0
-                raw_texts.append({"text": text, "confidence": conf})
-                if conf < self.MIN_CONFIDENCE or not target or target not in self._normalize(text):
-                    continue
+                pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+                x1, y1 = int(np.floor(pts[:, 0].min())), int(np.floor(pts[:, 1].min()))
+                x2, y2 = int(np.ceil(pts[:, 0].max())), int(np.ceil(pts[:, 1].max()))
                 bw, bh = x2 - x1, y2 - y1
+                if bw <= 0 or bh <= 0:
+                    continue
                 px, py = max(2, int(bw * 0.15)), max(2, int(bh * 0.25))
-                roi = self._clip(frame, (x1-px, y1-py, bw+2*px, bh+2*py))
-                found.append((roi, text, conf))
+                roi_small = self._clip(frame, (x1-px, y1-py, bw+2*px, bh+2*py))
+                x, y, rw, rh = roi_small
+                roi = self._clip(clip_frame, (x*sx, y*sy, rw*sx, rh*sy))
+                found.append((roi, text, confidence))
         except Exception as exc:
             self._report("error", f"OCR 偵測失敗：{type(exc).__name__}: {exc}", frame_no)
 
-        # Deduplicate only strongly overlapping boxes; never dedupe by text alone.
         found.sort(key=lambda item: item[2], reverse=True)
         unique = []
         for item in found:
-            if not any(self._iou(item[0], old[0]) > 0.75 for old in unique):
+            if not any(self._iou(item[0], old[0]) > 0.82 for old in unique):
                 unique.append(item)
         elapsed = time.monotonic() - started
-        self._report("ocr_done", f"OCR 完成，耗時 {elapsed:.2f} 秒；符合目標 {len(unique)} 個",
-                     frame_no, elapsed_seconds=elapsed, result_count=len(raw_texts),
-                     target_count=len(unique), target_text=self.target_text,
-                     ocr_results=raw_texts[:20])
+        if report:
+            self._report("ocr_done", f"OCR 完成，耗時 {elapsed:.2f} 秒；符合目標 {len(unique)} 個",
+                         frame_no, elapsed_seconds=elapsed, result_count=len(raw_texts),
+                         target_count=len(unique), target_text=self.target_text,
+                         ocr_results=raw_texts[:20])
         return unique, elapsed
 
     def _new_track(self, frame, detection, track_id):
@@ -170,55 +168,245 @@ class OCRTrackingThread(QThread):
         last_frame = self.start_frame
         success = False
         try:
-            self.progress_signal.emit(self.start_frame, "正在載入 OCR 模型...")
-            self._report("loading", "正在載入 EasyOCR 模型", self.start_frame)
+            if sv is None:
+                raise RuntimeError(
+                    "尚未安裝 ByteTrack 依賴套件。請在目前 Python 環境執行：python -m pip install supervision"
+                )
+
+            self.progress_signal.emit(self.start_frame, "正在載入 OCR 與 ByteTrack...")
+            self._report("loading", "正在載入 EasyOCR 與 ByteTrack", self.start_frame)
             reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError("無法開啟影片檔案。")
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
             ret, frame = cap.read()
             if not ret:
                 raise RuntimeError("無法讀取起始影格。")
 
-            detections, _ = self._ocr_all(reader, frame, self.start_frame)
-            tracks = []
-            next_id = 1
-            for detection in detections:
-                tracks.append(self._new_track(frame, detection, next_id)); next_id += 1
-            if not tracks:
-                self._report("not_found", f"起始影格找不到目標文字：{self.target_text}", self.start_frame)
+            # ByteTrack associates OCR detections at detection steps. CSRT propagates each
+            # confirmed track on intervening frames, so the output still has per-frame ROIs.
+            byte_tracker = sv.ByteTrack(
+                track_activation_threshold=0.10,
+                lost_track_buffer=30,
+                minimum_matching_threshold=0.80,
+                frame_rate=max(1, int(round(fps / self.OCR_INTERVAL))),
+                minimum_consecutive_frames=1,
+            )
+
+            def update_bytetrack(detections):
+                if detections:
+                    xyxy = np.asarray([
+                        [r[0], r[1], r[0] + r[2], r[1] + r[3]]
+                        for r, _txt, _conf in detections
+                    ], dtype=np.float32)
+                    confidence = np.asarray([max(0.01, min(1.0, float(d[2]))) for d in detections], dtype=np.float32)
+                    dets = sv.Detections(
+                        xyxy=xyxy,
+                        confidence=confidence,
+                        class_id=np.zeros(len(detections), dtype=int),
+                    )
+                else:
+                    dets = sv.Detections.empty()
+                return byte_tracker.update_with_detections(dets)
+
+            def map_track_detections(detections, tracked):
+                """Map ByteTrack output boxes to OCR detections; each detection used once."""
+                mapped = []
+                if len(tracked) == 0 or tracked.tracker_id is None:
+                    return mapped
+                used = set()
+                for j, box in enumerate(tracked.xyxy):
+                    tid = int(tracked.tracker_id[j])
+                    tracked_roi = self._clip(frame, (box[0], box[1], box[2]-box[0], box[3]-box[1]))
+                    best_i, best_iou = None, 0.0
+                    for i, det in enumerate(detections):
+                        if i in used:
+                            continue
+                        score = self._iou(tracked_roi, det[0])
+                        if score > best_iou:
+                            best_i, best_iou = i, score
+                    if best_i is not None and best_iou >= 0.10:
+                        used.add(best_i)
+                        mapped.append((tid, detections[best_i]))
+                return mapped
+
+            # Phase 1: fast coarse search. OCR runs on a resized image every few frames,
+            # instead of spending a full-resolution OCR pass on every empty frame.
+            hit_frame_no = None
+            search_frame_no = self.start_frame
+            while search_frame_no < self.total_frames:
+                if self.isInterruptionRequested():
+                    self._report("cancelled", "使用者取消搜尋目標", search_frame_no)
+                    return
+                if search_frame_no != self.start_frame:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, search_frame_no)
+                    ret, frame = cap.read()
+                if not ret:
+                    break
+                original_frame = frame
+                fh, fw = frame.shape[:2]
+                scale = min(1.0, self.SEARCH_MAX_DIM / float(max(fh, fw)))
+                if scale < 1.0:
+                    search_img = cv2.resize(frame, (max(1, int(round(fw*scale))),
+                                                    max(1, int(round(fh*scale)))),
+                                            interpolation=cv2.INTER_AREA)
+                else:
+                    search_img = frame
+                detections, _ = self._ocr_all(
+                    reader, search_img, search_frame_no,
+                    coordinate_frame=original_frame,
+                    canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
+                if detections:
+                    hit_frame_no = search_frame_no
+                    self._report("search_hit", f"快速搜尋在第 {hit_frame_no} 幀找到目標，正在高畫質初始化多目標…",
+                                 hit_frame_no, target_count=len(detections))
+                    break
+                self._report("searching", f"快速搜尋中：F{search_frame_no}/{self.total_frames}，尚未找到「{self.target_text}」",
+                             search_frame_no, target_text=self.target_text)
+                self.progress_signal.emit(search_frame_no,
+                    f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
+                search_frame_no += self.SEARCH_STEP
+                ret = True
+
+            if hit_frame_no is None:
+                self._report("not_found", f"從起始影格到影片結尾都找不到目標文字：{self.target_text}",
+                             max(self.start_frame, min(search_frame_no, self.total_frames-1)))
                 return
 
-            def snapshot(frame_no, active_tracks):
-                # Record all active boxes for every processed frame, not one ROI per frame.
-                rois = []
-                for t in active_tracks:
-                    if t["lost"] <= self.MAX_PREDICTED_GAP:
-                        roi = tuple(map(int, self._clip(frame, t["roi"])))
-                        if not any(self._iou(roi, old) > 0.80 for old in rois):
-                            rois.append(roi)
-                data[frame_no] = rois
-                return [(t["id"], tuple(map(int, self._clip(frame, t["roi"]))))
-                        for t in active_tracks if t["lost"] <= self.MAX_PREDICTED_GAP]
+            # Phase 2: full-resolution burst scan around the first hit. This is what
+            # prevents initialization from stopping after the first detected instance.
+            burst_start = max(self.start_frame, hit_frame_no - self.INIT_BURST_BEFORE)
+            burst_end = min(self.total_frames - 1, hit_frame_no + self.INIT_BURST_AFTER)
+            burst_cache = {}
+            burst_frames = {}
+            cap.set(cv2.CAP_PROP_POS_FRAMES, burst_start)
+            for burst_no in range(burst_start, burst_end + 1):
+                if self.isInterruptionRequested():
+                    self._report("cancelled", "使用者取消多目標初始化", burst_no)
+                    return
+                ret, burst_frame = cap.read()
+                if not ret:
+                    break
+                burst_frames[burst_no] = burst_frame
+                burst_cache[burst_no], _ = self._ocr_all(
+                    reader, burst_frame, burst_no,
+                    canvas_size=self.DETECT_CANVAS_SIZE, report=True)
 
-            data[self.start_frame] = [t["roi"] for t in tracks]
-            self._draw_monitor(frame, self.start_frame, [(t["id"], t["roi"]) for t in tracks], "INITIAL OCR")
-            self._report("locked", f"起始影格找到 {len(tracks)} 個符合目標的區域", self.start_frame,
-                         target_text=self.target_text, target_count=len(tracks), tracked_frames=1)
-            self.progress_signal.emit(self.start_frame, f"已找到 {len(tracks)} 個目標，開始追蹤")
-            last_frame = self.start_frame
+            detected_burst_frames = [n for n, dets in burst_cache.items() if dets]
+            if not detected_burst_frames:
+                self._report("searching", "快速搜尋命中後，高畫質複查未確認目標；繼續向後搜尋…", hit_frame_no)
+                # Avoid treating a low-resolution false positive as a locked target.
+                search_frame_no = burst_end + 1
+                ret = True
+                while search_frame_no < self.total_frames:
+                    if self.isInterruptionRequested():
+                        self._report("cancelled", "使用者取消搜尋目標", search_frame_no)
+                        return
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, search_frame_no)
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    fh, fw = frame.shape[:2]
+                    scale = min(1.0, self.SEARCH_MAX_DIM / float(max(fh, fw)))
+                    search_img = cv2.resize(frame, (max(1, int(round(fw*scale))), max(1, int(round(fh*scale)))), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
+                    detections, _ = self._ocr_all(reader, search_img, search_frame_no, coordinate_frame=frame, canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
+                    if detections:
+                        hit_frame_no = search_frame_no
+                        burst_start = max(self.start_frame, hit_frame_no-self.INIT_BURST_BEFORE)
+                        burst_end = min(self.total_frames-1, hit_frame_no+self.INIT_BURST_AFTER)
+                        burst_cache.clear(); burst_frames.clear()
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, burst_start)
+                        for burst_no in range(burst_start, burst_end+1):
+                            ret, burst_frame = cap.read()
+                            if not ret: break
+                            burst_frames[burst_no] = burst_frame
+                            burst_cache[burst_no], _ = self._ocr_all(reader, burst_frame, burst_no, canvas_size=self.DETECT_CANVAS_SIZE, report=True)
+                        detected_burst_frames = [n for n, dets in burst_cache.items() if dets]
+                        if detected_burst_frames:
+                            break
+                    self.progress_signal.emit(search_frame_no, f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
+                    search_frame_no += self.SEARCH_STEP
+                if not detected_burst_frames:
+                    self._report("not_found", f"從起始影格到影片結尾都找不到可確認的目標文字：{self.target_text}",
+                                 max(self.start_frame, min(search_frame_no, self.total_frames-1)))
+                    return
+
+            # Start live trackers on the latest burst frame with confirmed detections.
+            # Earlier burst detections are retained for immediate frame-accurate mosaicing.
+            initial_frame_no = max(detected_burst_frames)
+            frame = burst_frames[initial_frame_no]
+            detections = burst_cache[initial_frame_no]
+            tracked = update_bytetrack(detections)
+            mapped = map_track_detections(detections, tracked)
+            tracks = {}
+            used_detection_indices = set()
+            for tid, detection in mapped:
+                tracks[tid] = self._new_track(frame, detection, tid)
+                for di, candidate in enumerate(detections):
+                    if di not in used_detection_indices and candidate is detection:
+                        used_detection_indices.add(di)
+                        break
+            manual_id = 100000
+            for di, detection in enumerate(detections):
+                if di in used_detection_indices:
+                    continue
+                if any(self._iou(detection[0], t["roi"]) >= 0.80 for t in tracks.values()):
+                    continue
+                tracks[manual_id] = self._new_track(frame, detection, manual_id)
+                manual_id += 1
+
+            # Save direct OCR boxes for every frame in the initialization burst. This gives
+            # the export an immediate mask even when CSRT's first update would be imperfect.
+            for burst_no, burst_dets in burst_cache.items():
+                data[burst_no] = [tuple(map(int, d[0])) for d in burst_dets]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, initial_frame_no + 1)
+            ret = True
+
+            def record_frame(frame_no, current_frame):
+                rois = []
+                draw = []
+                for tid, t in list(tracks.items()):
+                    if t["lost"] > self.MAX_PREDICTED_GAP:
+                        continue
+                    roi = tuple(map(int, self._clip(current_frame, t["roi"])))
+                    # Deduplicate overlapping boxes only, never by text or ID.
+                    if not any(self._iou(roi, old) > 0.88 for old in rois):
+                        rois.append(roi)
+                        draw.append((tid, roi))
+                # Keep high-resolution OCR boxes from the initialization burst even if a
+                # tracker has not stabilized yet on that exact frame.
+                for detection in burst_cache.get(frame_no, []):
+                    roi = tuple(map(int, self._clip(current_frame, detection[0])))
+                    if not any(self._iou(roi, old) > 0.88 for old in rois):
+                        rois.append(roi)
+                data[frame_no] = rois
+                return draw
+
+            data[initial_frame_no] = [tuple(map(int, d[0])) for d in detections]
+            initial = [(tid, t["roi"]) for tid, t in tracks.items()]
+            self._draw_monitor(frame, initial_frame_no, initial, "BURST INIT + BYTETRACK")
+            self._report("locked", f"高畫質初始化完成：第 {initial_frame_no} 幀有 {len(detections)} 個目標區域，軌跡 {len(tracks)} 條",
+                         initial_frame_no, target_text=self.target_text, target_count=len(detections), tracked_frames=len(burst_cache))
+            self.progress_signal.emit(initial_frame_no,
+                f"初始化找到 {len(detections)} 個目標，開始追蹤")
+            last_frame = initial_frame_no
             stop_reason = "已處理至影片結尾"
 
-            for i in range(self.start_frame + 1, self.total_frames):
+            for i in range(initial_frame_no + 1, self.total_frames):
                 if self.isInterruptionRequested():
-                    stop_reason = "使用者取消追蹤"; break
+                    stop_reason = "使用者取消追蹤"
+                    break
                 ret, frame = cap.read()
                 if not ret:
-                    stop_reason = "影片讀取結束或讀取失敗"; break
+                    stop_reason = "影片讀取結束或讀取失敗"
+                    break
                 last_frame = i
-                # Update every tracker on every frame.
-                for t in tracks:
+
+                # Dense frame-by-frame propagation by CSRT; a failed update keeps the last
+                # plausible box only for a bounded grace window, then is excluded from masking.
+                for t in tracks.values():
                     ok, bbox = t["tracker"].update(frame)
                     if ok and bbox[2] > 1 and bbox[3] > 1:
                         t["roi"] = self._clip(frame, bbox)
@@ -226,52 +414,69 @@ class OCRTrackingThread(QThread):
                     else:
                         t["lost"] += 1
 
-                should_ocr = ((i - self.start_frame) % self.OCR_INTERVAL == 0 or
-                              not any(t["lost"] <= self.MAX_PREDICTED_GAP for t in tracks))
+                active_tracks = [t for t in tracks.values() if t["lost"] <= self.MAX_PREDICTED_GAP]
+                adaptive_interval = self.ADAPTIVE_OCR_INTERVAL if any(t["lost"] > 0 for t in active_tracks) else self.OCR_INTERVAL
+                should_ocr = (i in burst_cache or
+                              (i - initial_frame_no) % adaptive_interval == 0 or
+                              not active_tracks)
+                elapsed = 0.0
                 if should_ocr:
-                    detections, elapsed = self._ocr_all(reader, frame, i)
-                    # Greedy one-to-one association using IoU and center distance.
-                    pairs = []
-                    for ti, t in enumerate(tracks):
-                        for di, (roi, _text, _conf) in enumerate(detections):
-                            c1, c2 = self._center(t["roi"]), self._center(roi)
-                            dist = math.hypot(c1[0]-c2[0], c1[1]-c2[1])
-                            scale = max(20.0, math.hypot(t["roi"][2], t["roi"][3]))
-                            iou = self._iou(t["roi"], roi)
-                            # A strict size-scaled gate avoids assigning one row's text to another row.
-                            if iou >= 0.05 or dist <= max(35.0, scale * 1.8):
-                                pairs.append((iou * 2.0 - dist / max(scale, 1.0), ti, di))
-                    pairs.sort(reverse=True)
-                    used_tracks, used_dets = set(), set()
-                    for _score, ti, di in pairs:
-                        if ti in used_tracks or di in used_dets:
-                            continue
-                        t = tracks[ti]
-                        roi, text, conf = detections[di]
-                        t["roi"], t["lost"], t["text"], t["confidence"] = roi, 0, text, conf
-                        t["tracker"] = self._create_tracker(); t["tracker"].init(frame, roi)
-                        used_tracks.add(ti); used_dets.add(di)
-                    # Every unmatched detection becomes a new independent target.
-                    for di, detection in enumerate(detections):
-                        if di not in used_dets:
-                            tracks.append(self._new_track(frame, detection, next_id)); next_id += 1
-                    # Remove stale trackers only after the grace period.
-                    tracks = [t for t in tracks if t["lost"] <= self.MAX_PREDICTED_GAP]
-                    self._report("tracking", f"多目標追蹤中：{sum(t['lost'] == 0 for t in tracks)} 個正常、{len(tracks)} 個有效框",
-                                 i, target_count=len(tracks), elapsed_seconds=elapsed,
-                                 lost_count=sum(t["lost"] > 0 for t in tracks), patience=self.MAX_PREDICTED_GAP)
+                    if i in burst_cache:
+                        detections = burst_cache[i]
+                    else:
+                        detections, elapsed = self._ocr_all(reader, frame, i)
+                    tracked = update_bytetrack(detections)
+                    mapped = map_track_detections(detections, tracked)
+                    seen_ids = set()
+                    for tid, detection in mapped:
+                        roi, text, conf = detection
+                        seen_ids.add(tid)
+                        if tid in tracks:
+                            t = tracks[tid]
+                            t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf})
+                            t["tracker"] = self._create_tracker()
+                            t["tracker"].init(frame, roi)
+                        else:
+                            tracks[tid] = self._new_track(frame, detection, tid)
 
-                rois_with_ids = [(t["id"], tuple(map(int, self._clip(frame, t["roi"]))))
-                                 for t in tracks if t["lost"] <= self.MAX_PREDICTED_GAP]
-                # Deduplicate identical boxes while keeping distinct, separated occurrences.
-                unique_with_ids = []
-                for tid, roi in rois_with_ids:
-                    if not any(self._iou(roi, old_roi) > 0.85 for _, old_roi in unique_with_ids):
-                        unique_with_ids.append((tid, roi))
-                data[i] = [roi for _, roi in unique_with_ids]  # explicit entry for each frame
-                if i % 3 == 0:
-                    self._draw_monitor(frame, i, unique_with_ids, "MULTI TRACKING" if unique_with_ids else "SEARCHING")
-                    self.progress_signal.emit(i, f"多目標追蹤：F{i}/{self.total_frames}，有效框 {len(unique_with_ids)}")
+                    # ByteTrack may not emit a tracker_id for a newly seen detection until its
+                    # activation rules pass. Keep unmatched OCR detections rather than losing them.
+                    matched_detection_rois = [det[0] for _tid, det in mapped]
+                    for detection in detections:
+                        if any(self._iou(detection[0], r) >= 0.10 for r in matched_detection_rois):
+                            continue
+                        # Associate unmatched detection with a nearby existing track if plausible;
+                        # otherwise create a temporary independent track. It will be reconciled
+                        # by ByteTrack on a later OCR step.
+                        candidates = []
+                        for tid, t in tracks.items():
+                            c1, c2 = self._center(t["roi"]), self._center(detection[0])
+                            scale = max(20.0, math.hypot(t["roi"][2], t["roi"][3]))
+                            dist = math.hypot(c1[0]-c2[0], c1[1]-c2[1])
+                            if self._iou(t["roi"], detection[0]) >= 0.10 or dist <= scale * 1.5:
+                                candidates.append((dist, tid))
+                        if candidates:
+                            _dist, tid = min(candidates)
+                            t = tracks[tid]
+                            t.update({"roi": detection[0], "lost": 0, "text": detection[1], "confidence": detection[2]})
+                            t["tracker"] = self._create_tracker(); t["tracker"].init(frame, detection[0])
+                        else:
+                            tid = max(100000, max([99999, *tracks.keys()]) + 1)
+                            tracks[tid] = self._new_track(frame, detection, tid)
+
+                    # Prune stale tracks after ByteTrack had a chance to reconnect detections.
+                    tracks = {tid: t for tid, t in tracks.items() if t["lost"] <= self.MAX_PREDICTED_GAP}
+                    self._report("tracking", f"ByteTrack 關聯完成：偵測 {len(detections)} 個，活躍軌跡 {len(tracks)} 個",
+                                 i, target_count=len(tracks), elapsed_seconds=elapsed,
+                                 lost_count=sum(t["lost"] > 0 for t in tracks.values()),
+                                 patience=self.MAX_PREDICTED_GAP, detection_count=len(detections))
+
+                rois_with_ids = record_frame(i, frame)
+                if i % 12 == 0:
+                    self._draw_monitor(frame, i, rois_with_ids,
+                                       "BYTETRACK + CSRT" if rois_with_ids else "SEARCHING")
+                    self.progress_signal.emit(i, f"追蹤 F{i}/{self.total_frames}，有效框 {len(rois_with_ids)}")
+
             success = bool(data)
             self._report("finished", stop_reason, last_frame, tracked_frames=len(data),
                          target_count=max((len(v) for v in data.values()), default=0), success=success)
