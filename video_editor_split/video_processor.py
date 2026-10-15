@@ -10,6 +10,11 @@ import easyocr
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
+try:
+    from global_feature_gate import GlobalFeatureGate
+except ImportError:  # Keep the original OCR workflow usable if the optional module is missing.
+    GlobalFeatureGate = None
+
 
 class OCRTrackingThread(QThread):
     progress_signal = pyqtSignal(int, str)
@@ -366,11 +371,14 @@ class OCRTrackingThread(QThread):
             detections = burst_cache[initial_frame_no]
             tracks = {}
             next_track_id = 1
+            feature_gate = GlobalFeatureGate() if GlobalFeatureGate is not None else None
             for detection in detections:
                 # Every distinct OCR box starts as its own track; no path is inferred between boxes.
                 if any(self._iou(detection[0], t["roi"]) >= 0.80 for t in tracks.values()):
                     continue
                 tracks[next_track_id] = self._new_track(frame, detection, next_track_id, initial_frame_no)
+                if feature_gate is not None:
+                    feature_gate.add_template(frame, detection[0])
                 next_track_id += 1
 
             # Save direct OCR boxes for every frame in the initialization burst. This gives
@@ -463,12 +471,28 @@ class OCRTrackingThread(QThread):
                 should_ocr = (i in burst_cache or
                               (i - initial_frame_no) % adaptive_interval == 0 or
                               not active_tracks)
+                # The gate is deliberately used only during recovery, when no track has
+                # a valid current-frame observation. Normal periodic OCR remains unchanged.
+                recovery_mode = not any(t["lost"] == 0 for t in active_tracks)
+                if (should_ocr and recovery_mode and i not in burst_cache and
+                        feature_gate is not None):
+                    decision = feature_gate.should_run_ocr(frame)
+                    should_ocr = decision.should_run_ocr
+                    if not should_ocr and decision.score is not None:
+                        # Low-cost diagnostic event; this does not alter tracking or masks.
+                        self._report("feature_gate_skip",
+                                     f"全域特徵門控略過本次 OCR（相似度 {decision.score:.3f}）",
+                                     i, feature_score=decision.score,
+                                     gate_reason=decision.reason,
+                                     gate_skipped=feature_gate.skip_count)
                 elapsed = 0.0
                 if should_ocr:
                     if i in burst_cache:
                         detections = burst_cache[i]
                     else:
                         detections, elapsed = self._ocr_all(reader, frame, i)
+                        if feature_gate is not None and recovery_mode:
+                            feature_gate.mark_ocr_run()
                     matches, used_detection_indices = self._associate_detections(frame, detections, tracks, i)
                     for tid, di, match_score in matches:
                         detection = detections[di]
@@ -477,6 +501,8 @@ class OCRTrackingThread(QThread):
                         t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf,
                                   "state": "OCR_CONFIRMED", "last_seen_frame": i,
                                   "center": self._center(roi)})
+                        if feature_gate is not None:
+                            feature_gate.add_template(frame, roi)
                         # Keep the original appearance template stable; do not learn from uncertain matches.
                         t["tracker"] = self._create_tracker()
                         t["tracker"].init(frame, roi)
@@ -490,6 +516,8 @@ class OCRTrackingThread(QThread):
                         if any(self._iou(detection[0], t["roi"]) > 0.82 for t in tracks.values() if t["lost"] == 0):
                             continue
                         tracks[next_track_id] = self._new_track(frame, detection, next_track_id, i)
+                        if feature_gate is not None:
+                            feature_gate.add_template(frame, detection[0])
                         next_track_id += 1
 
                     # Keep briefly lost tracks available for conservative re-identification,

@@ -1,44 +1,26 @@
-# OCR 目標追蹤與即時監控版
-
-這份專案以原本的 PyQt5 影片編輯器為基礎，保留 OCR 搜尋、目標追蹤、即時監控視窗與逐幀馬賽克匯出流程。
-
-## 本版的追蹤策略
-
-1. EasyOCR 在初始化搜尋與週期性校正時找出符合指定文字的框。
-2. CSRT 每一幀更新目標框，不必為了追蹤而降低影片播放速度。
-3. OCR 再次偵測時，使用位置距離、框重疊與簡單外觀特徵做一對一關聯。
-4. 不會只因為新框離某個舊框最近，就強制把它接到舊 ID；不合理的大幅位置跳躍會被拒絕。
-5. **不對兩個端點之間的路徑做自動插值。** 只有當該幀的 CSRT 更新成功且位置變化合理，或該幀有直接 OCR 偵測時，才記錄馬賽克 ROI。
-6. 追蹤失敗時，監控視窗會顯示舊位置與失敗狀態供診斷，但舊位置不會被寫入該幀的馬賽克資料。
-
-## 即時監控顏色
-
-- 綠色：OCR 直接確認
-- 青色：CSRT 逐幀追蹤成功，可遮罩
-- 黃色：追蹤遺失，舊框只供監控顯示，不會遮罩
-- 紅色：CSRT 框出現不合理的大幅跳躍，已拒絕該位置
-
-監控預覽約每 2 幀更新一次。這個頻率只影響監控視窗刷新，不會改變影片本身的 FPS。
-
-## 安裝
-
-建議在 Windows 虛擬環境中執行：
-
-```bash
-python -m venv .venv
-.venv\\Scripts\\activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements_ocr_tracking.txt
-```
-
-EasyOCR 第一次執行時可能會下載模型。程式目前以 `gpu=False` 執行，適合先在 CPU 環境測試。
-
-## 啟動
-
-```bash
-python main.py
-```
-
-## 重要限制
-
-外觀特徵、OCR 文字與位置都相同的物件，如果在中間影格完全遮擋或交錯，傳統影像追蹤無法保證辨識出真實身分。本版採取保守策略：不因為兩個影格都出現相同文字，就推論中間必定存在一條移動路徑。仍請逐幀檢查匯出影片，尤其是追蹤遺失或身分可能交換的區段。
+Global Feature Gate — OCR recovery optimization
+This package adds a separate global_feature_gate.py module and integrates it into video_processor.py.
+What it changes
+- Adds a low-resolution global template-matching check for recovery OCR.
+- Uses the gate only when all active tracks are currently lost. Normal periodic OCR and the initialization scan remain unchanged.
+- Skips an OCR call only when every confirmed target template has very low global similarity.
+- Runs OCR for uncertain/matching frames and forces a periodic OCR safety check.
+- Learns templates only from OCR-confirmed target boxes; it does not use stale CSRT boxes as new templates.
+- Does not change main.py or the mosaic export format.
+Install / apply
+1. Make a backup or commit your current branch first.
+2. Put global_feature_gate.py beside video_processor.py.
+3. Replace video_processor.py with the included version.
+4. Keep your existing dependencies. The gate uses OpenCV and NumPy already used by the project.
+The module import has a fallback, so if global_feature_gate.py is absent, the original OCR workflow still runs without this optimization.
+Test
+Run from the project folder:
+python -m unittest -v test_global_feature_gate.py
+python -m py_compile video_processor.py global_feature_gate.py
+Tuning and safety
+ABSENCE_THRESHOLD is deliberately low (0.22): OCR is skipped only when the match score is very poor. Matching thresholds depend on footage, scale, motion blur, overlays, and crop padding. Validate on representative videos before raising it. A periodic forced OCR check reduces, but cannot eliminate, the risk of missing a brief appearance between checks.
+Git
+git status
+git add video_processor.py global_feature_gate.py test_global_feature_gate.py README_global_feature_gate.md
+git commit -m "feat: add conservative global feature gate for OCR recovery"
+git push
