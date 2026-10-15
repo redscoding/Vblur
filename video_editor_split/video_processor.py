@@ -12,8 +12,8 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 try:
     from global_feature_gate import GlobalFeatureGate
-except ImportError:  # Keep the original OCR workflow usable if the optional module is missing.
-    GlobalFeatureGate = None
+except ImportError:  # package import fallback
+    from .global_feature_gate import GlobalFeatureGate
 
 
 class OCRTrackingThread(QThread):
@@ -26,17 +26,18 @@ class OCRTrackingThread(QThread):
     # Search is deliberately cheaper than steady-state tracking. A coarse search can
     # miss a target that appears for fewer than SEARCH_STEP frames; the full-resolution
     # burst after the first hit compensates for initialization misses around that point.
-    SEARCH_STEP = 3
+    SEARCH_STEP = 3  # minimum search interval; GlobalFeatureGate backs off adaptively
     SEARCH_MAX_DIM = 960
     SEARCH_CANVAS_SIZE = 1280
-    INIT_BURST_BEFORE = 2
-    INIT_BURST_AFTER = 5
+    # Keep the high-resolution initialization burst short to avoid long pauses.
+    INIT_BURST_BEFORE = 1
+    INIT_BURST_AFTER = 2
     OCR_INTERVAL = 6
     ADAPTIVE_OCR_INTERVAL = 2
     MIN_CONFIDENCE = 0.20
     MAX_PREDICTED_GAP = 10
     DETECT_CANVAS_SIZE = 1920
-    MONITOR_INTERVAL = 2  # update the visual monitor every N frames
+    MONITOR_INTERVAL = 1  # refresh monitor every frame (OCR itself remains synchronous)
     MOTION_JUMP_DIAGONALS = 1.8
     MATCH_MIN_SCORE = 0.27
 
@@ -148,6 +149,36 @@ class OCRTrackingThread(QThread):
                          ocr_results=raw_texts[:20])
         return unique, elapsed
 
+    def _ocr_roi(self, reader, frame, frame_no, roi):
+        """Run OCR only in an expanded crop around a tracked target and map boxes back."""
+        h, w = frame.shape[:2]
+        x, y, rw, rh = self._clip(frame, roi)
+        # Expand crop to tolerate small tracker drift and changes in text size.
+        pad_x = max(12, int(rw * 0.75))
+        pad_y = max(12, int(rh * 1.00))
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(w, x + rw + pad_x)
+        y2 = min(h, y + rh + pad_y)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return [], 0.0
+        detections, elapsed = self._ocr_all(
+            reader, crop, frame_no, canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
+        mapped = []
+        for box, text, confidence in detections:
+            bx, by, bw, bh = box
+            mapped.append((self._clip(frame, (bx + x1, by + y1, bw, bh)), text, confidence))
+        # De-duplicate overlapping detections from nearby ROI crops.
+        mapped.sort(key=lambda item: item[2], reverse=True)
+        unique = []
+        for item in mapped:
+            if not any(self._iou(item[0], old[0]) > 0.82 for old in unique):
+                unique.append(item)
+        self._report("ocr_done", f"ROI OCR 完成，耗時 {elapsed:.2f} 秒；符合目標 {len(unique)} 個",
+                     frame_no, elapsed_seconds=elapsed, target_count=len(unique), ocr_mode="roi")
+        return unique, elapsed
+
     @staticmethod
     def _appearance_signature(frame, roi):
         """A cheap visual fingerprint. It is supporting evidence, never identity proof."""
@@ -251,6 +282,7 @@ class OCRTrackingThread(QThread):
             self.progress_signal.emit(self.start_frame, "正在載入 OCR 與外觀/運動關聯...")
             self._report("loading", "正在載入 EasyOCR；啟用保守的逐幀追蹤關聯", self.start_frame)
             reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
+            gate = GlobalFeatureGate()
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError("無法開啟影片檔案。")
@@ -290,6 +322,7 @@ class OCRTrackingThread(QThread):
                     coordinate_frame=original_frame,
                     canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
                 if detections:
+                    gate.report_search_result(True)
                     hit_frame_no = search_frame_no
                     self._report("search_hit", f"快速搜尋在第 {hit_frame_no} 幀找到目標，正在高畫質初始化多目標…",
                                  hit_frame_no, target_count=len(detections))
@@ -298,7 +331,8 @@ class OCRTrackingThread(QThread):
                              search_frame_no, target_text=self.target_text)
                 self.progress_signal.emit(search_frame_no,
                     f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
-                search_frame_no += self.SEARCH_STEP
+                gate.report_search_result(False)
+                search_frame_no += gate.search_interval()
                 ret = True
 
             if hit_frame_no is None:
@@ -344,6 +378,7 @@ class OCRTrackingThread(QThread):
                     search_img = cv2.resize(frame, (max(1, int(round(fw*scale))), max(1, int(round(fh*scale)))), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
                     detections, _ = self._ocr_all(reader, search_img, search_frame_no, coordinate_frame=frame, canvas_size=self.SEARCH_CANVAS_SIZE, report=False)
                     if detections:
+                        gate.report_search_result(True)
                         hit_frame_no = search_frame_no
                         burst_start = max(self.start_frame, hit_frame_no-self.INIT_BURST_BEFORE)
                         burst_end = min(self.total_frames-1, hit_frame_no+self.INIT_BURST_AFTER)
@@ -358,7 +393,8 @@ class OCRTrackingThread(QThread):
                         if detected_burst_frames:
                             break
                     self.progress_signal.emit(search_frame_no, f"快速搜尋 F{search_frame_no}/{self.total_frames}…")
-                    search_frame_no += self.SEARCH_STEP
+                    gate.report_search_result(False)
+                    search_frame_no += gate.search_interval()
                 if not detected_burst_frames:
                     self._report("not_found", f"從起始影格到影片結尾都找不到可確認的目標文字：{self.target_text}",
                                  max(self.start_frame, min(search_frame_no, self.total_frames-1)))
@@ -371,14 +407,11 @@ class OCRTrackingThread(QThread):
             detections = burst_cache[initial_frame_no]
             tracks = {}
             next_track_id = 1
-            feature_gate = GlobalFeatureGate() if GlobalFeatureGate is not None else None
             for detection in detections:
                 # Every distinct OCR box starts as its own track; no path is inferred between boxes.
                 if any(self._iou(detection[0], t["roi"]) >= 0.80 for t in tracks.values()):
                     continue
                 tracks[next_track_id] = self._new_track(frame, detection, next_track_id, initial_frame_no)
-                if feature_gate is not None:
-                    feature_gate.add_template(frame, detection[0])
                 next_track_id += 1
 
             # Save direct OCR boxes for every frame in the initialization burst. This gives
@@ -467,32 +500,26 @@ class OCRTrackingThread(QThread):
                         t["state"] = "LOST"
 
                 active_tracks = [t for t in tracks.values() if t["lost"] <= self.MAX_PREDICTED_GAP]
-                adaptive_interval = self.ADAPTIVE_OCR_INTERVAL if any(t["lost"] > 0 for t in active_tracks) else self.OCR_INTERVAL
-                should_ocr = (i in burst_cache or
-                              (i - initial_frame_no) % adaptive_interval == 0 or
-                              not active_tracks)
-                # The gate is deliberately used only during recovery, when no track has
-                # a valid current-frame observation. Normal periodic OCR remains unchanged.
-                recovery_mode = not any(t["lost"] == 0 for t in active_tracks)
-                if (should_ocr and recovery_mode and i not in burst_cache and
-                        feature_gate is not None):
-                    decision = feature_gate.should_run_ocr(frame)
-                    should_ocr = decision.should_run_ocr
-                    if not should_ocr and decision.score is not None:
-                        # Low-cost diagnostic event; this does not alter tracking or masks.
-                        self._report("feature_gate_skip",
-                                     f"全域特徵門控略過本次 OCR（相似度 {decision.score:.3f}）",
-                                     i, feature_score=decision.score,
-                                     gate_reason=decision.reason,
-                                     gate_skipped=feature_gate.skip_count)
+                has_uncertain_track = any(t["lost"] > 0 for t in active_tracks)
+                decision = gate.decide_tracking(i, active_tracks, has_uncertain_track)
+                should_ocr = (i in burst_cache) or decision.run_ocr
                 elapsed = 0.0
                 if should_ocr:
                     if i in burst_cache:
                         detections = burst_cache[i]
+                    elif decision.mode == "roi" and active_tracks:
+                        detections = []
+                        for track in active_tracks:
+                            if track["lost"] != 0:
+                                continue
+                            roi_dets, roi_elapsed = self._ocr_roi(reader, frame, i, track["roi"])
+                            elapsed += roi_elapsed
+                            for det in roi_dets:
+                                if not any(self._iou(det[0], old[0]) > 0.82 for old in detections):
+                                    detections.append(det)
                     else:
                         detections, elapsed = self._ocr_all(reader, frame, i)
-                        if feature_gate is not None and recovery_mode:
-                            feature_gate.mark_ocr_run()
+                        gate.note_full_scan(i)
                     matches, used_detection_indices = self._associate_detections(frame, detections, tracks, i)
                     for tid, di, match_score in matches:
                         detection = detections[di]
@@ -501,8 +528,6 @@ class OCRTrackingThread(QThread):
                         t.update({"roi": roi, "lost": 0, "text": text, "confidence": conf,
                                   "state": "OCR_CONFIRMED", "last_seen_frame": i,
                                   "center": self._center(roi)})
-                        if feature_gate is not None:
-                            feature_gate.add_template(frame, roi)
                         # Keep the original appearance template stable; do not learn from uncertain matches.
                         t["tracker"] = self._create_tracker()
                         t["tracker"].init(frame, roi)
@@ -516,8 +541,6 @@ class OCRTrackingThread(QThread):
                         if any(self._iou(detection[0], t["roi"]) > 0.82 for t in tracks.values() if t["lost"] == 0):
                             continue
                         tracks[next_track_id] = self._new_track(frame, detection, next_track_id, i)
-                        if feature_gate is not None:
-                            feature_gate.add_template(frame, detection[0])
                         next_track_id += 1
 
                     # Keep briefly lost tracks available for conservative re-identification,
@@ -525,6 +548,8 @@ class OCRTrackingThread(QThread):
                     tracks = {tid: t for tid, t in tracks.items() if t["lost"] <= self.MAX_PREDICTED_GAP}
                     self._report("tracking", f"外觀/運動關聯完成：OCR 偵測 {len(detections)} 個，追蹤 ID {len(tracks)} 個",
                                  i, target_count=len(tracks), elapsed_seconds=elapsed,
+                                 ocr_mode=(decision.mode if should_ocr else "skipped"),
+                                 ocr_reason=(decision.reason if should_ocr else "gate skipped redundant OCR"),
                                  lost_count=sum(t["lost"] > 0 for t in tracks.values()),
                                  patience=self.MAX_PREDICTED_GAP, detection_count=len(detections))
 
