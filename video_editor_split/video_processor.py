@@ -1,587 +1,846 @@
-"""Hybrid tracking + redetection for a PyQt5 video mosaic application.
+"""Multi-target tracking + sparse full-frame/local RapidOCR verification + mosaic export.
 
-Features
---------
-* Manual ROI initialization.
-* CSRT primary tracker (KCF fallback when CSRT is unavailable).
-* Kalman constant-velocity prediction.
-* Candidate validation using displacement, size and appearance similarity.
-* Recovery in stages: local template search -> coarse full-frame search -> OCR
-  (when a target string is supplied).
-* Explicit TRACKING / SUSPECT / REDETECT / LOST states and per-frame output.
-* Compatible with the existing GUI signals and VideoProcessorThread API.
-
-Important: this is a practical classical-CV baseline, not a guarantee of perfect
-tracking. Review LOST / UNCERTAIN intervals before using an exported video for
-privacy-sensitive purposes.
+Requires: opencv-contrib-python, rapidocr-onnxruntime, PyQt5. EasyOCR/PyTorch is not used.
+tracking_data format: {absolute_frame_index: [(x, y, w, h), ...]}
 """
-from __future__ import annotations
-
 import math
 import time
-from typing import Optional, Tuple
-
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
-Box = Tuple[int, int, int, int]
+
+try:
+    from scipy.optimize import linear_sum_assignment
+except Exception:
+    linear_sum_assignment = None
 
 
-class _OpticalFlowTracker:
-    """Small OpenCV-only fallback when opencv-contrib trackers are unavailable."""
-    def __init__(self):
-        self.prev_gray = None
-        self.points = None
-        self.box = None
+class IntuitionisticFuzzyDecision:
+    """Small IFS evidence combiner. Scores are heuristics and must be calibrated per dataset."""
 
-    def init(self, frame, bbox):
-        x, y, w, h = [int(round(float(v))) for v in bbox]
-        self.box = (x, y, w, h)
-        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mask = np.zeros(self.prev_gray.shape, dtype=np.uint8)
-        mask[max(0, y):max(0, y) + h, max(0, x):max(0, x) + w] = 255
-        self.points = cv2.goodFeaturesToTrack(self.prev_gray, maxCorners=80, qualityLevel=0.01,
-                                              minDistance=4, mask=mask, blockSize=7)
-        return self.points is not None and len(self.points) >= 3
+    @staticmethod
+    def evaluate(ocr_confidence, motion_score, appearance_score, iou_score):
+        values = [float(np.clip(v, 0.0, 1.0)) for v in
+                  (ocr_confidence, motion_score, appearance_score, iou_score)]
+        ocr, motion, appearance, iou = values
+        support = 0.50 * ocr + 0.22 * motion + 0.18 * appearance + 0.10 * iou
+        opposition = 0.38 * (1.0 - motion) + 0.30 * (1.0 - appearance) + 0.32 * (1.0 - ocr)
+        # Construct an intuitionistic fuzzy pair with mu + nu <= 1.
+        mu = support * (1.0 - opposition)
+        nu = opposition * (1.0 - support)
+        mu = float(np.clip(mu, 0.0, 1.0))
+        nu = float(np.clip(nu, 0.0, 1.0 - mu))
+        pi = float(np.clip(1.0 - mu - nu, 0.0, 1.0))
+        if mu >= 0.28 and mu > nu:
+            decision = "ACCEPT"
+        elif pi >= 0.36 or abs(mu - nu) < 0.08:
+            decision = "UNCERTAIN"
+        else:
+            decision = "REJECT"
+        return {"mu": mu, "nu": nu, "pi": pi, "decision": decision}
 
-    def update(self, frame):
-        if self.prev_gray is None or self.box is None or self.points is None or len(self.points) < 3:
-            return False, self.box or (0, 0, 1, 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, gray, self.points, None, winSize=(21, 21), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
-        if next_points is None or status is None:
-            self.prev_gray = gray
-            return False, self.box
-        good_old = self.points[status.reshape(-1) == 1].reshape(-1, 2)
-        good_new = next_points[status.reshape(-1) == 1].reshape(-1, 2)
-        if len(good_new) < 3:
-            self.prev_gray = gray
-            self.points = None
-            return False, self.box
-        delta = np.median(good_new - good_old, axis=0)
-        x, y, w, h = self.box
-        fh, fw = gray.shape[:2]
-        nx = int(round(x + float(delta[0])))
-        ny = int(round(y + float(delta[1])))
-        nx = max(0, min(nx, fw - 1))
-        ny = max(0, min(ny, fh - 1))
-        w, h = min(w, fw - nx), min(h, fh - ny)
-        self.box = (nx, ny, max(1, w), max(1, h))
-        # Keep points that remain inside the updated box; replenish if too few remain.
-        inside = ((good_new[:, 0] >= nx) & (good_new[:, 0] <= nx + w) &
-                  (good_new[:, 1] >= ny) & (good_new[:, 1] <= ny + h))
-        kept = good_new[inside].astype(np.float32).reshape(-1, 1, 2)
-        if len(kept) < 8:
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            mask[ny:ny+h, nx:nx+w] = 255
-            replenished = cv2.goodFeaturesToTrack(gray, maxCorners=80, qualityLevel=0.01,
-                                                   minDistance=4, mask=mask, blockSize=7)
-            if replenished is not None:
-                kept = replenished
-        self.points = kept if kept is not None and len(kept) >= 3 else None
-        self.prev_gray = gray
-        return self.points is not None, self.box
+
+class SortMotionModel:
+    """SORT-style constant-velocity Kalman model for one bounding box.
+
+    State: [center_x, center_y, width, height, vx, vy, vw, vh].
+    OCR detections correct the model; accepted CSRT boxes provide intermediate updates.
+    """
+
+    def __init__(self, roi):
+        x, y, w, h = [float(v) for v in roi]
+        self.kf = cv2.KalmanFilter(8, 4)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0, 0, 0],
+            [0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 0, 1, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0, 0],
+        ], dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(8, dtype=np.float32) * 0.025
+        self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 0.20
+        self.kf.errorCovPost = np.eye(8, dtype=np.float32) * 1.0
+        self.kf.statePost = np.array([
+            [x + w / 2.0], [y + h / 2.0], [max(1.0, w)], [max(1.0, h)],
+            [0.0], [0.0], [0.0], [0.0]
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _state_to_box(state):
+        cx, cy, w, h = [float(v) for v in state[:4].reshape(-1)]
+        w, h = max(2.0, w), max(2.0, h)
+        return (int(round(cx - w / 2.0)), int(round(cy - h / 2.0)),
+                int(round(w)), int(round(h)))
+
+    def predict(self):
+        return self._state_to_box(self.kf.predict())
+
+    def correct(self, roi):
+        x, y, w, h = [float(v) for v in roi]
+        measurement = np.array([[x + w / 2.0], [y + h / 2.0],
+                                [max(1.0, w)], [max(1.0, h)]], dtype=np.float32)
+        corrected = self.kf.correct(measurement)
+        return self._state_to_box(corrected)
 
 
 class OCRTrackingThread(QThread):
-    """Compatibility name retained for the current main.py GUI."""
+    """Fast tracking worker: Kalman/SORT-style state, optical-flow updates, OCR on demand.
 
+    initial_roi: optional (x, y, w, h) in the start_frame. If supplied, the worker
+    starts from the user's selection and does not need full-frame OCR to initialize.
+    tracking_data format remains {absolute_frame_index: [(x, y, w, h), ...]}.
+    """
     progress_signal = pyqtSignal(int, str)
     finished_signal = pyqtSignal(dict, int, bool)
     monitor_frame_signal = pyqtSignal(object, int, str)
     monitor_data_signal = pyqtSignal(dict)
 
+    # OCR runs only on sparse keyframes or after tracking loss, never every frame.
+    GLOBAL_OCR_INTERVAL = 45          # full-frame target search about every 1.5 s at 30 FPS
+    LOCAL_RECOVERY_INTERVAL = 12      # local ROI retry (~0.4 s at 30 FPS), with backoff
+    MAX_OCR_ROI_DIM = 640             # bound local OCR input dimensions for speed
+    MAX_GLOBAL_OCR_DIM = 960          # downscale full-frame keyframes to this max dimension
+    MIN_FEATURE_POINTS = 4
+    MAX_LOST_FRAMES = 3  # 達 3 幀仍失追就停止輸出該軌跡的馬賽克框
+    CONSERVATIVE_MASK_FRAMES = 5  # 短暫失追時使用擴大的 Kalman 預測框，降低漏遮罩風險
+    RECOVERY_SCALE = 3.0
+    DETECT_CANVAS_SIZE = 1280
+    MIN_OCR_CONFIDENCE = 0.20
     MONITOR_INTERVAL = 2
-    PROGRESS_INTERVAL = 10
-    OCR_INTERVAL = 12
-    OCR_RETRY_COOLDOWN = 8
-    MIN_APPEARANCE_SCORE = 0.42
-    LOCAL_SEARCH_RADIUS = 2.0
-    GLOBAL_SEARCH_MAX_WIDTH = 720
-    MAX_LOST_FRAMES_BEFORE_GLOBAL = 2
-    UNCERTAIN_GRACE_FRAMES = 1
+    INTERPOLATE_MAX_GAP = 2
+    USE_MSER_PREFILTER = False  # Avoid MSER false negatives blocking OCR.
 
-    def __init__(self, video_path, start_frame, total_frames, target_text="",
-                 initial_roi=None, tracker_name="CSRT"):
+    def __init__(self, video_path, start_frame, total_frames, target_text, initial_roi=None):
         super().__init__()
-        self.video_path = str(video_path)
+        self.video_path = video_path
         self.start_frame = max(0, int(start_frame))
         self.total_frames = max(0, int(total_frames))
-        self.target_text = str(target_text or "").strip()
-        self.initial_roi = tuple(map(int, initial_roi)) if initial_roi else None
-        self.tracker_name = str(tracker_name or "CSRT").upper()
-        self._cancelled = False
-
-    def requestInterruption(self):
-        self._cancelled = True
-        super().requestInterruption()
+        self.target_text = str(target_text or '')
+        self.initial_roi = tuple(initial_roi) if initial_roi is not None else None
 
     def _report(self, stage, message, frame_no=None, **extra):
-        self.monitor_data_signal.emit({
-            "stage": stage, "message": message, "frame": frame_no,
-            "clock": time.monotonic(), **extra
-        })
+        self.monitor_data_signal.emit({'stage': stage, 'message': message,
+            'frame': frame_no, 'clock': time.monotonic(), **extra})
 
     @staticmethod
-    def _clip(frame, roi) -> Box:
+    def _clip(frame, roi):
         h, w = frame.shape[:2]
         x, y, rw, rh = [int(round(float(v))) for v in roi]
-        x = max(0, min(x, w - 1))
-        y = max(0, min(y, h - 1))
-        rw = max(1, min(rw, w - x))
-        rh = max(1, min(rh, h - y))
+        x = max(0, min(x, w - 1)); y = max(0, min(y, h - 1))
+        rw = max(1, min(rw, w - x)); rh = max(1, min(rh, h - y))
         return x, y, rw, rh
 
     @staticmethod
     def _center(roi):
+        return roi[0] + roi[2] / 2.0, roi[1] + roi[3] / 2.0
+
+    @staticmethod
+    def _iou(a, b):
+        ax, ay, aw, ah = a; bx, by, bw, bh = b
+        x1, y1 = max(ax, bx), max(ay, by)
+        x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _normalize(text):
+        return ''.join(ch for ch in str(text).casefold() if ch.isalnum())
+
+    @staticmethod
+    def _create_reader():
+        """Load RapidOCR only. Avoid importing EasyOCR/PyTorch, which can fail on Windows DLLs."""
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            return {"backend": "rapidocr-onnxruntime", "engine": RapidOCR()}
+        except Exception as exc:
+            raise RuntimeError(
+                "RapidOCR 無法載入。請在目前執行 main.py 的同一個虛擬環境安裝：\n"
+                "python -m pip install --upgrade rapidocr-onnxruntime onnxruntime\n"
+                "若目前使用 Python 3.14，建議改用 64-bit Python 3.11/3.12 建立新 venv；"
+                "本版本不再載入 EasyOCR/PyTorch 作為備援。\n"
+                f"詳細錯誤：{type(exc).__name__}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _run_ocr_engine(reader, image):
+        """Return normalized [(quad, text, confidence)] from RapidOCR."""
+        backend = reader.get("backend")
+        engine = reader.get("engine")
+        if str(backend).startswith("rapidocr"):
+            output = engine(image)
+            results = output[0] if isinstance(output, tuple) else output
+            normalized = []
+            for item in results or []:
+                if len(item) >= 3:
+                    normalized.append((item[0], str(item[1]), float(item[2])))
+            return normalized
+        results = engine.readtext(image, detail=1, paragraph=False, decoder='greedy',
+            min_size=6, text_threshold=0.55, low_text=0.30, link_threshold=0.30,
+            canvas_size=640, mag_ratio=1.0, batch_size=1, workers=0)
+        return [(item[0], str(item[1]), float(item[2])) for item in (results or []) if len(item) >= 3]
+
+    @staticmethod
+    def _gray(frame):
+        # Optical-flow points are stored in original-frame coordinates, so the gray
+        # image must retain the original resolution (resizing here breaks coordinates).
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    @staticmethod
+    def _features(gray_frame, roi):
         x, y, w, h = roi
-        return x + w / 2.0, y + h / 2.0
+        crop = gray_frame[y:y+h, x:x+w]
+        if crop.size == 0:
+            return None
+        points = cv2.goodFeaturesToTrack(crop, maxCorners=60, qualityLevel=0.01,
+                                         minDistance=3, blockSize=3)
+        if points is None:
+            return None
+        points[:, 0, 0] += x
+        points[:, 0, 1] += y
+        return points.astype(np.float32)
 
     @staticmethod
-    def _diag(roi):
-        return max(8.0, math.hypot(roi[2], roi[3]))
-
-    @staticmethod
-    def _create_tracker(name="CSRT"):
-        """Create CSRT first; fall back to KCF/MOSSE based on installed OpenCV."""
-        order = [name.upper(), "CSRT", "KCF", "MOSSE"]
-        seen = set()
-        for tracker in order:
-            if tracker in seen:
-                continue
-            seen.add(tracker)
-            attr = {"CSRT": "TrackerCSRT_create", "KCF": "TrackerKCF_create",
-                    "MOSSE": "TrackerMOSSE_create"}.get(tracker)
-            if not attr:
-                continue
-            for owner in (getattr(cv2, "legacy", None), cv2):
-                factory = getattr(owner, attr, None) if owner is not None else None
-                if callable(factory):
-                    try:
-                        return factory(), tracker
-                    except Exception:
-                        pass
-        # OpenCV's standard wheel may not contain CSRT/KCF/MOSSE. Use optical flow
-        # as a fallback so the app remains runnable; the same validation and
-        # redetection pipeline still guards against drift.
-        return _OpticalFlowTracker(), "OPTICAL_FLOW"
-
-    @staticmethod
-    def _new_kalman(box):
-        kf = cv2.KalmanFilter(4, 2)
-        kf.transitionMatrix = np.array(
-            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32
-        )
-        kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
-        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
-        kf.errorCovPost = np.eye(4, dtype=np.float32)
-        cx, cy = OCRTrackingThread._center(box)
-        kf.statePost = np.array([[cx], [cy], [0.0], [0.0]], dtype=np.float32)
-        return kf
-
-    @staticmethod
-    def _gray_patch(frame, roi, size=None):
+    def _appearance(frame, roi):
         x, y, w, h = roi
         crop = frame[y:y+h, x:x+w]
         if crop.size == 0:
             return None
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        if size:
-            gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA if w > size[0] else cv2.INTER_LINEAR)
-        return gray
-
-    def _appearance_score(self, frame, roi, template):
-        if template is None:
-            return 0.0
-        patch = self._gray_patch(frame, roi, (template.shape[1], template.shape[0]))
-        if patch is None or patch.shape != template.shape:
-            return 0.0
-        try:
-            score = float(cv2.matchTemplate(patch, template, cv2.TM_CCOEFF_NORMED)[0, 0])
-            return max(-1.0, min(1.0, score)) if np.isfinite(score) else 0.0
-        except cv2.error:
-            return 0.0
-
-    def _local_template_search(self, frame, predicted_box, template):
-        """Search a bounded region around predicted location, at a few scales."""
-        if template is None:
-            return None, 0.0
-        fh, fw = frame.shape[:2]
-        px, py, pw, ph = self._clip(frame, predicted_box)
-        radius_x = max(pw * self.LOCAL_SEARCH_RADIUS, 40)
-        radius_y = max(ph * self.LOCAL_SEARCH_RADIUS, 30)
-        x1 = max(0, int(px + pw / 2 - radius_x))
-        y1 = max(0, int(py + ph / 2 - radius_y))
-        x2 = min(fw, int(px + pw / 2 + radius_x))
-        y2 = min(fh, int(py + ph / 2 + radius_y))
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None, 0.0
-        gray = cv2.equalizeHist(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
-        th, tw = template.shape[:2]
-        best_box, best_score = None, -1.0
-        for scale in (0.85, 1.0, 1.15):
-            sw, sh = max(8, int(tw * scale)), max(8, int(th * scale))
-            if sw > gray.shape[1] or sh > gray.shape[0]:
-                continue
-            t = template if (sw == tw and sh == th) else cv2.resize(
-                template, (sw, sh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-            )
-            try:
-                response = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
-                _, score, _, loc = cv2.minMaxLoc(response)
-            except cv2.error:
-                continue
-            if np.isfinite(score) and score > best_score:
-                best_score = float(score)
-                best_box = self._clip(frame, (x1 + loc[0], y1 + loc[1], sw, sh))
-        return best_box, max(0.0, best_score)
-
-    def _global_template_search(self, frame, template):
-        """Coarse downscaled full-frame scan, then refine around the best candidate."""
-        if template is None:
-            return None, 0.0
-        fh, fw = frame.shape[:2]
-        scale_down = min(1.0, self.GLOBAL_SEARCH_MAX_WIDTH / float(fw))
-        small = cv2.resize(frame, (max(1, int(fw * scale_down)), max(1, int(fh * scale_down))),
-                           interpolation=cv2.INTER_AREA) if scale_down < 1 else frame
-        gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
-        th, tw = template.shape[:2]
-        small_w, small_h = max(5, int(tw * scale_down)), max(5, int(th * scale_down))
-        if small_w >= gray.shape[1] or small_h >= gray.shape[0]:
-            return None, 0.0
-        base = cv2.resize(template, (small_w, small_h), interpolation=cv2.INTER_AREA) if scale_down < 1 else template
-        best_box, best_score = None, -1.0
-        for scale in (0.85, 1.0, 1.15):
-            sw, sh = max(5, int(small_w * scale)), max(5, int(small_h * scale))
-            if sw >= gray.shape[1] or sh >= gray.shape[0]:
-                continue
-            t = base if (sw == small_w and sh == small_h) else cv2.resize(
-                base, (sw, sh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-            )
-            try:
-                response = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
-                _, score, _, loc = cv2.minMaxLoc(response)
-            except cv2.error:
-                continue
-            if np.isfinite(score) and score > best_score:
-                best_score = float(score)
-                if scale_down < 1:
-                    best_box = self._clip(frame, (loc[0] / scale_down, loc[1] / scale_down,
-                                                   sw / scale_down, sh / scale_down))
-                else:
-                    best_box = self._clip(frame, (loc[0], loc[1], sw, sh))
-        if best_box is None:
-            return None, 0.0
-        # Refine at original resolution in a small area around coarse candidate.
-        bx, by, bw, bh = best_box
-        rx1, ry1 = max(0, bx - bw), max(0, by - bh)
-        rx2, ry2 = min(fw, bx + 2 * bw), min(fh, by + 2 * bh)
-        crop = frame[ry1:ry2, rx1:rx2]
-        target_w, target_h = bw, bh
-        if crop.size and target_w < crop.shape[1] and target_h < crop.shape[0]:
-            crop_gray = cv2.equalizeHist(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
-            # Keep refinement bounded; template scale is allowed to vary slightly.
-            for scale in (0.9, 1.0, 1.1):
-                sw, sh = max(5, int(tw * scale)), max(5, int(th * scale))
-                if sw >= crop_gray.shape[1] or sh >= crop_gray.shape[0]:
-                    continue
-                t = template if (sw == tw and sh == th) else cv2.resize(
-                    template, (sw, sh), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-                )
-                try:
-                    response = cv2.matchTemplate(crop_gray, t, cv2.TM_CCOEFF_NORMED)
-                    _, score, _, loc = cv2.minMaxLoc(response)
-                except cv2.error:
-                    continue
-                if np.isfinite(score) and score > best_score:
-                    best_score = float(score)
-                    best_box = self._clip(frame, (rx1 + loc[0], ry1 + loc[1], sw, sh))
-        return best_box, max(0.0, best_score)
+        gray = cv2.resize(gray, (48, 24), interpolation=cv2.INTER_AREA)
+        return cv2.equalizeHist(gray)
 
     @staticmethod
-    def _normalize(text):
-        return "".join(ch for ch in str(text).casefold() if ch.isalnum())
+    def _appearance_score(a, b):
+        if a is None or b is None or a.shape != b.shape:
+            return 0.0
+        return float(max(0.0, 1.0 - np.mean(cv2.absdiff(a, b)) / 255.0))
 
-    def _ocr_search(self, frame, reader, region=None):
-        """Find target_text in local region or full frame. Returns (box, conf, reader)."""
-        if not self.target_text:
-            return None, 0.0, reader
+    @staticmethod
+    def _estimate_global_motion(previous_gray, current_gray):
+        """Estimate dominant frame-to-frame camera/background motion with sparse LK flow.
+
+        This is a diagnostic heuristic, not a calibrated camera-motion estimator.
+        Returns median displacement magnitude and median dx/dy in original pixels.
+        """
         try:
-            if reader is None:
-                import easyocr
-                reader = easyocr.Reader(["ch_tra", "en"], gpu=False)
-            fh, fw = frame.shape[:2]
-            if region is None:
-                x1, y1, x2, y2 = 0, 0, fw, fh
-                crop = frame
+            h, w = previous_gray.shape[:2]
+            scale = min(1.0, 640.0 / max(h, w))
+            if scale < 1.0:
+                prev = cv2.resize(previous_gray, (max(1, int(w*scale)), max(1, int(h*scale))))
+                curr = cv2.resize(current_gray, (max(1, int(w*scale)), max(1, int(h*scale))))
             else:
-                x, y, w, h = self._clip(frame, region)
-                pad_x, pad_y = max(w, 40), max(h, 30)
-                x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-                x2, y2 = min(fw, x + w + pad_x), min(fh, y + h + pad_y)
-                crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                return None, 0.0, reader
-            results = reader.readtext(crop, detail=1, paragraph=False, decoder="greedy",
-                                      canvas_size=960 if region is None else 640, min_size=8)
-            target = self._normalize(self.target_text)
-            best_box, best_conf = None, 0.0
-            for item in results or []:
-                if len(item) < 3:
-                    continue
-                text, conf = str(item[1]), float(item[2])
-                normalized = self._normalize(text)
-                if not target or (target not in normalized and normalized not in target):
-                    continue
-                if conf < 0.25:
-                    continue
-                pts = np.asarray(item[0], dtype=np.float32).reshape(-1, 2)
-                bx1, by1 = pts.min(axis=0)
-                bx2, by2 = pts.max(axis=0)
-                bw, bh = max(1.0, bx2 - bx1), max(1.0, by2 - by1)
-                # Expand OCR text box to cover a useful mosaic region.
-                pad_w, pad_h = max(4, int(bw * 0.22)), max(3, int(bh * 0.30))
-                out_w = bw + 2 * pad_w
-                out_h = bh + 2 * pad_h
-                # OCR often returns only the glyph rectangle, while the manually
-                # selected ROI may include a full plate/object. Keep a useful mask
-                # area by expanding around the OCR center to at least 80% of the
-                # initial ROI dimensions.
-                initial = getattr(self, "_initial_roi", None)
-                if initial is not None:
-                    out_w = max(out_w, int(initial[2] * 0.80))
-                    out_h = max(out_h, int(initial[3] * 0.80))
-                center_x, center_y = x1 + (bx1 + bx2) / 2.0, y1 + (by1 + by2) / 2.0
-                candidate = self._clip(frame, (center_x - out_w / 2, center_y - out_h / 2,
-                                                out_w, out_h))
-                if conf > best_conf:
-                    best_box, best_conf = candidate, conf
-            return best_box, best_conf, reader
-        except Exception as exc:
-            self._report("ocr_error", f"OCR 重檢測失敗：{type(exc).__name__}: {exc}")
-            return None, 0.0, reader
+                prev, curr = previous_gray, current_gray
+            points = cv2.goodFeaturesToTrack(prev, maxCorners=250, qualityLevel=0.01,
+                                             minDistance=8, blockSize=5)
+            if points is None or len(points) < 8:
+                # Keep the return contract consistent with the caller: (magnitude, dx, dy, point_count).
+                return 0.0, 0.0, 0.0, 0
+            nxt, status, _ = cv2.calcOpticalFlowPyrLK(
+                prev, curr, points, None, winSize=(21, 21), maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
+            if nxt is None or status is None:
+                return 0.0, 0.0, 0.0, 0
+            good = status.reshape(-1) == 1
+            good_count = int(np.count_nonzero(good))
+            if good_count < 8:
+                return 0.0, 0.0, 0.0, good_count
+            delta = (nxt[good] - points[good]).reshape(-1, 2)
+            dx, dy = np.median(delta, axis=0) / scale
+            mag = float(np.median(np.linalg.norm(delta, axis=1)) / scale)
+            return mag, float(dx), float(dy), good_count
+        except Exception:
+            return 0.0, 0.0, 0.0, 0
 
-    def _valid_candidate(self, frame, candidate, predicted, last_box, template,
-                         appearance_threshold=None):
-        if candidate is None:
-            return False, 0.0, "no_candidate"
-        candidate = self._clip(frame, candidate)
-        x, y, w, h = candidate
-        if w < 5 or h < 5:
-            return False, 0.0, "box_too_small"
-        if last_box is not None:
-            old_w, old_h = last_box[2], last_box[3]
-            area_ratio = (w * h) / max(1.0, old_w * old_h)
-            if area_ratio < 0.30 or area_ratio > 3.2:
-                return False, 0.0, "size_jump"
-        # Permit faster movement than a strictly local tracker, but reject wild jumps.
-        if predicted is not None:
-            c1, c2 = self._center(candidate), self._center(predicted)
-            max_dist = max(100.0, 4.5 * self._diag(last_box or candidate))
-            if math.hypot(c1[0] - c2[0], c1[1] - c2[1]) > max_dist:
-                return False, 0.0, "position_jump"
-        appearance = self._appearance_score(frame, candidate, template)
-        threshold = self.MIN_APPEARANCE_SCORE if appearance_threshold is None else appearance_threshold
-        if appearance < threshold:
-            return False, appearance, "appearance_low"
-        return True, appearance, "ok"
+    @staticmethod
+    def _blur_score(frame, roi):
+        """Laplacian variance inside ROI. Low values can indicate blur/low texture."""
+        try:
+            x, y, w, h = [int(v) for v in roi]
+            crop = frame[y:y+h, x:x+w]
+            if crop.size == 0 or crop.shape[0] < 3 or crop.shape[1] < 3:
+                return 0.0
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+            return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        except Exception:
+            return 0.0
 
-    def _draw_monitor(self, frame, frame_no, roi, state, score, tracker_label, note=""):
-        shown = frame.copy()
-        colors = {
-            "INITIAL": (0, 220, 0), "TRACKING": (0, 220, 0),
-            "SUSPECT": (0, 190, 255), "REDETECT": (255, 180, 0),
-            "LOST": (0, 0, 255), "OCR_RECOVERED": (255, 255, 0),
-            "TEMPLATE_RECOVERED": (255, 255, 0), "UNCERTAIN": (0, 0, 255),
-        }
-        color = colors.get(state, (255, 255, 255))
-        if roi is not None:
+    @staticmethod
+    def _create_visual_tracker(frame, roi):
+        # 建立每個目標獨立的 CSRT tracker；不可用時退回 Kalman + 光流。
+        try:
+            creator = getattr(cv2, 'TrackerCSRT_create', None)
+            if creator is None and hasattr(cv2, 'legacy'):
+                creator = getattr(cv2.legacy, 'TrackerCSRT_create', None)
+            if creator is None:
+                return None
+            tracker = creator()
+            x, y, w, h = [int(v) for v in roi]
+            tracker.init(frame, (x, y, w, h))
+            return tracker
+        except Exception:
+            return None
+
+    def _new_track(self, frame, roi, track_id, frame_no, text='', confidence=1.0):
+        roi = self._clip(frame, roi)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        appearance = self._appearance(frame, roi)
+        return {'id': track_id, 'roi': roi, 'predicted_roi': roi,
+                'kalman': SortMotionModel(roi), 'points': self._features(gray, roi),
+                'visual_tracker': self._create_visual_tracker(frame, roi),
+                'appearance': appearance, 'anchor_appearance': appearance, 'lost': 0,
+                'speed': 0.0, 'text': text, 'confidence': float(confidence),
+                'state': 'MANUAL_INIT' if self.initial_roi is not None else 'OCR_CONFIRMED',
+                'last_seen_frame': int(frame_no), 'last_ocr_frame': int(frame_no),
+                'last_local_search_frame': int(frame_no), 'recovery_attempts': 0,
+                'loss_reason': '', 'last_diagnostics': {}}
+
+    @staticmethod
+    def _expand_roi(frame, roi, scale):
+        x, y, w, h = [float(v) for v in roi]
+        cx, cy = x + w / 2, y + h / 2
+        nw, nh = max(12, w * scale), max(12, h * scale)
+        return OCRTrackingThread._clip(frame, (cx - nw/2, cy - nh/2, nw, nh))
+
+    def _ocr(self, reader, frame, frame_no, roi=None, full_frame=False, robust=False):
+        """OCR a local ROI, or a downscaled full frame on sparse recovery keyframes only."""
+        started = time.monotonic()
+        if full_frame:
+            fh, fw = frame.shape[:2]
+            x, y, w, h = 0, 0, fw, fh
+            crop = frame
+            max_dim = self.MAX_GLOBAL_OCR_DIM
+        else:
+            if roi is None:
+                self._report('ocr_skipped', '局部 OCR 缺少 ROI', frame_no)
+                return [], 0.0
             x, y, w, h = self._clip(frame, roi)
-            cv2.rectangle(shown, (x, y), (x + w, y + h), color, 2)
-            label = f"{state} score={score:.2f}"
-            cv2.putText(shown, label, (x, max(18, y - 7)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 2, cv2.LINE_AA)
-        cv2.putText(shown, f"F{frame_no} | {tracker_label} | {note[:60]}", (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        self.monitor_frame_signal.emit(shown, int(frame_no), state)
+            crop = frame[y:y+h, x:x+w]
+            max_dim = self.MAX_OCR_ROI_DIM
+        if crop.size == 0:
+            return [], 0.0
+
+        # Keep small text at native size; downscale only oversized inputs.
+        ch, cw = crop.shape[:2]
+        scale = min(1.0, max_dim / float(max(ch, cw)))
+        ocr_crop = crop if scale >= 1.0 else cv2.resize(
+            crop, (max(1, int(cw*scale)), max(1, int(ch*scale))), interpolation=cv2.INTER_AREA)
+        target = self._normalize(self.target_text)
+        found, raw = [], []
+        gray = cv2.cvtColor(ocr_crop, cv2.COLOR_BGR2GRAY) if ocr_crop.ndim == 3 else ocr_crop
+        variants = [("original", ocr_crop)]
+        if robust:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+            adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                             cv2.THRESH_BINARY, 31, 11)
+            variants.extend([("clahe_gray", clahe), ("adaptive_threshold", adaptive),
+                             ("inverted_threshold", cv2.bitwise_not(adaptive))])
+
+        for variant_name, variant_image in variants:
+            try:
+                results = self._run_ocr_engine(reader, variant_image)
+            except Exception as exc:
+                self._report('error', f'OCR {variant_name} 失敗：{type(exc).__name__}: {exc}', frame_no)
+                results = []
+            for pts, text, conf in results:
+                normalized = self._normalize(text)
+                raw.append({'text': text, 'confidence': conf, 'variant': variant_name})
+                # If no target text is supplied, don't let OCR create new identities.
+                if conf < self.MIN_OCR_CONFIDENCE or not target or target not in normalized:
+                    continue
+                pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+                x1, y1 = np.floor(pts.min(axis=0)).astype(int)
+                x2, y2 = np.ceil(pts.max(axis=0)).astype(int)
+                # Map OCR coordinates from resized ROI back to original frame coordinates.
+                x1, x2 = int(x1 / scale), int(x2 / scale)
+                y1, y2 = int(y1 / scale), int(y2 / scale)
+                bw, bh = x2-x1, y2-y1
+                if bw <= 0 or bh <= 0:
+                    continue
+                px, py = max(2, int(bw*.12)), max(2, int(bh*.20))
+                box = self._clip(frame, (x+x1-px, y+y1-py, bw+2*px, bh+2*py))
+                found.append((box, text, conf))
+            if found:
+                break  # only pay for preprocessing variants if the original failed
+
+        found.sort(key=lambda d: d[2], reverse=True)
+        unique = []
+        for item in found:
+            if not any(self._iou(item[0], prev[0]) > .82 for prev in unique):
+                unique.append(item)
+        elapsed = time.monotonic() - started
+        mode = 'GLOBAL_KEYFRAME' if full_frame else 'LOCAL_ROI'
+        self._report('ocr_done', f'OCR {mode} 完成：{elapsed:.2f}s，目標 {len(unique)} 個',
+                     frame_no, elapsed_seconds=elapsed, target_count=len(unique), ocr_results=raw[:20],
+                     roi=(x, y, w, h), mode=mode)
+        return unique, elapsed
+
+    def _draw_monitor(self, frame, frame_no, tracks, mode):
+        shown = frame.copy()
+        colors = {'OCR_CONFIRMED': (0, 220, 0), 'MANUAL_INIT': (0, 220, 0),
+                  'TRACKING': (255, 210, 0), 'FAST_MOTION': (255, 0, 255),
+                  'RECOVERY': (0, 190, 255), 'LOST': (0, 0, 255)}
+        for tid, track in tracks.items():
+            # Hide stale visualization after three consecutive lost frames; keep the
+            # internal track state so local OCR may still recover it later.
+            if int(track.get('lost', 0)) > self.MAX_LOST_FRAMES:
+                continue
+            roi = track.get('roi', (0, 0, 1, 1))
+            x, y, w, h = roi
+            state = track.get('state', 'TRACKING')
+            color = colors.get(state, (255, 255, 255))
+            cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
+            reason = track.get('loss_reason', '')
+            label = f'ID {tid} {state} v={track.get("speed", 0):.1f}' + (f' [{reason}]' if reason else '')
+            cv2.putText(shown, label, (x, max(18, y-5)), cv2.FONT_HERSHEY_SIMPLEX,
+                        .48, color, 2, cv2.LINE_AA)
+        cv2.putText(shown, f'Frame {frame_no} | {mode} | tracks={len(tracks)}', (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2, cv2.LINE_AA)
+        self.monitor_frame_signal.emit(shown, int(frame_no), mode)
+
+    @staticmethod
+    def _interpolate_short_gaps(history, max_gap=2):
+        for track_history in history.values():
+            frames = sorted(k for k, v in track_history.items() if v is not None)
+            for left, right in zip(frames, frames[1:]):
+                gap = right-left-1
+                if 0 < gap <= max_gap:
+                    a, b = track_history[left], track_history[right]
+                    for frame_no in range(left+1, right):
+                        ratio = (frame_no-left)/(right-left)
+                        track_history[frame_no] = tuple(int(round(a[i]*(1-ratio)+b[i]*ratio)) for i in range(4))
 
     def run(self):
         cap = None
         data = {}
         last_frame = self.start_frame
         success = False
-        cancelled = False
-        reader = None
-        tracked_count = 0
-        lost_count = 0
         try:
-            if self.initial_roi is None or len(self.initial_roi) != 4 or self.initial_roi[2] <= 0 or self.initial_roi[3] <= 0:
-                raise RuntimeError("缺少有效的手動初始框。請先在預覽影格中手動框選目標。")
-            self.progress_signal.emit(self.start_frame, "正在載入影片並初始化混合追蹤...")
+            self.progress_signal.emit(self.start_frame, '載入影片與追蹤模組...')
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
-                raise RuntimeError("無法開啟影片檔案。")
+                raise RuntimeError('無法開啟影片檔案。')
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if not math.isfinite(source_fps) or source_fps <= 0:
+                source_fps = 0.0
+            self._report('video_info', f'影片資訊：{source_fps:.2f} FPS，{frame_count} frames',
+                         self.start_frame, fps=source_fps, frame_count=frame_count)
+            end_frame = min(self.total_frames, frame_count) if self.total_frames > 0 else frame_count
+            if end_frame <= self.start_frame:
+                raise RuntimeError('起始影格超出影片範圍。')
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
-            ok, first_frame = cap.read()
-            if not ok:
-                raise RuntimeError(f"無法讀取起始影格 F{self.start_frame}。")
-            current_box = self._clip(first_frame, self.initial_roi)
-            self._initial_roi = current_box
-            if current_box[2] < 5 or current_box[3] < 5:
-                raise RuntimeError("初始框太小，請重新框選較完整的目標。")
-            template = self._gray_patch(first_frame, current_box)
-            tracker, tracker_label = self._create_tracker(self.tracker_name)
-            tracker.init(first_frame, tuple(map(float, current_box)))
-            kalman = self._new_kalman(current_box)
-            last_valid_box = current_box
-            last_ocr_frame = -10**9
-            self._report("initialized", f"初始化完成；追蹤器={tracker_label}；模式={'OCR' if self.target_text else '一般物體'}",
-                         self.start_frame, bbox=current_box, tracker=tracker_label)
-            data[self.start_frame] = [current_box]
-            tracked_count += 1
-            self._draw_monitor(first_frame, self.start_frame, current_box, "INITIAL", 1.0, tracker_label)
+            ret, first_frame = cap.read()
+            if not ret:
+                raise RuntimeError('無法讀取起始影格。')
 
-            frame_no = self.start_frame + 1
-            while True:
-                if self.isInterruptionRequested() or self._cancelled:
-                    cancelled = True
-                    self._report("cancelled", "使用者取消追蹤", last_frame)
+            # Strict ROI-only design: the user must draw the target box; no full-frame OCR.
+            tracks = {}
+            next_id = 1
+            hit_frame = self.start_frame
+            reader = None
+            if self.target_text.strip():
+                self.progress_signal.emit(hit_frame, '正在載入 RapidOCR（僅 ONNX Runtime，不載入 PyTorch）...')
+                reader = self._create_reader()
+                self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
+            if self.initial_roi is None:
+                raise RuntimeError('此效能版禁止全畫面 OCR。請先在預覽畫面框選單一目標，再開始追蹤。')
+            roi = self._clip(first_frame, self.initial_roi)
+            if roi[2] < 3 or roi[3] < 3:
+                raise RuntimeError('使用者選取的 ROI 太小或超出畫面。')
+            tracks[next_id] = self._new_track(first_frame, roi, next_id, hit_frame,
+                                              self.target_text, 1.0)
+            self._report('locked', f'使用人工選取 ROI 初始化追蹤：{roi}', hit_frame,
+                         roi=roi, mode='INIT')
+            if self.target_text.strip():
+                self.progress_signal.emit(hit_frame, '已框選目標；RapidOCR 會定期掃描縮小後的關鍵影格，失追時另做局部恢復...')
+
+            # Start output history at the initialization frame.
+            history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
+            data[hit_frame] = [tuple(t['roi']) for t in tracks.values()]
+            self._draw_monitor(first_frame, hit_frame, tracks, 'TRACK MODE')
+            previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+            cached_global_motion = cached_camera_dx = cached_camera_dy = 0.0
+            cached_global_points = 0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, hit_frame + 1)
+
+            for frame_no in range(hit_frame+1, end_frame):
+                if self.isInterruptionRequested():
+                    self._report('cancelled', '使用者取消追蹤', frame_no, mode='TRACK MODE')
                     break
                 ret, frame = cap.read()
                 if not ret:
                     break
                 last_frame = frame_no
-                frame_started = time.monotonic()
-                prediction = kalman.predict()
-                pcx, pcy = float(prediction[0, 0]), float(prediction[1, 0])
-                px, py, pw, ph = last_valid_box
-                predicted_box = self._clip(frame, (pcx - pw / 2, pcy - ph / 2, pw, ph))
+                current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame_h, frame_w = frame.shape[:2]
+                detections = []
+                need_local_recovery = []
+                # Per-frame flag used by monitoring/reporting below.
+                ran_ocr = False
+                # Global motion is diagnostic only, so estimate it every 3 frames rather than
+                # spending extra CPU on full-frame feature detection on every frame.
+                if frame_no % 10 == 0:
+                    (cached_global_motion, cached_camera_dx, cached_camera_dy,
+                     cached_global_points) = self._estimate_global_motion(previous_gray, current_gray)
+                global_motion, camera_dx, camera_dy, global_points = (
+                    cached_global_motion, cached_camera_dx, cached_camera_dy, cached_global_points)
+                # Heuristic only: large coherent image motion may indicate camera movement.
+                camera_moving = global_motion >= 6.0 and global_points >= 8
 
-                candidate = None
-                appearance = 0.0
-                reason = "tracker_failed"
-                tracker_ok = False
-                try:
-                    ok_track, raw_box = tracker.update(frame)
-                    if ok_track:
-                        raw_box = self._clip(frame, raw_box)
-                        valid, appearance, reason = self._valid_candidate(
-                            frame, raw_box, predicted_box, last_valid_box, template
-                        )
-                        if valid:
-                            candidate = raw_box
-                            tracker_ok = True
-                        else:
-                            self._report("suspect", f"追蹤候選未通過檢查：{reason}", frame_no,
-                                         candidate=raw_box, appearance=appearance)
-                except Exception as exc:
-                    reason = f"tracker_exception:{type(exc).__name__}"
-
-                state = "TRACKING" if tracker_ok else "SUSPECT"
-                score = appearance
-                # OCR periodically corrects text targets; local OCR first to keep it cheaper.
-                if self.target_text and (frame_no % self.OCR_INTERVAL == 0 or not tracker_ok):
-                    if frame_no - last_ocr_frame >= self.OCR_RETRY_COOLDOWN:
-                        last_ocr_frame = frame_no
-                        ocr_box, ocr_conf, reader = self._ocr_search(
-                            frame, reader, region=last_valid_box if lost_count < self.MAX_LOST_FRAMES_BEFORE_GLOBAL else None
-                        )
-                        if ocr_box is not None:
-                            # OCR identity is a strong signal; allow a lower visual score but
-                            # still require plausible size and location unless global search ran.
-                            ocr_valid, ocr_app, ocr_reason = self._valid_candidate(
-                                frame, ocr_box, predicted_box, last_valid_box, template,
-                                appearance_threshold=0.18
-                            )
-                            if ocr_valid or lost_count >= self.MAX_LOST_FRAMES_BEFORE_GLOBAL:
-                                candidate = ocr_box
-                                tracker_ok = True
-                                state = "OCR_RECOVERED"
-                                score = ocr_conf
-                                try:
-                                    tracker, tracker_label = self._create_tracker(self.tracker_name)
-                                    tracker.init(frame, tuple(map(float, candidate)))
-                                except Exception as exc:
-                                    self._report("tracker_reinit_error", f"OCR 校正後重新初始化追蹤器失敗：{exc}", frame_no)
-                                self._report("ocr_recovered", f"OCR 找回目標（信心 {ocr_conf:.2f}）", frame_no,
-                                             bbox=ocr_box, ocr_confidence=ocr_conf, appearance=ocr_app)
-
-                # Redetection is only run when normal tracking/OCR did not produce a valid box.
-                if candidate is None:
-                    state = "REDETECT"
-                    self._report("redetect", f"追蹤異常（{reason}），正在重新搜尋", frame_no)
-                    recovered, recover_score = self._local_template_search(frame, predicted_box, template)
-                    if recovered is not None and recover_score >= 0.50:
-                        valid, app, why = self._valid_candidate(
-                            frame, recovered, predicted_box, last_valid_box, template,
-                            appearance_threshold=0.48
-                        )
-                        if valid:
-                            candidate, score, state = recovered, app, "TEMPLATE_RECOVERED"
-                    # If local search fails for a few frames, do a coarse global scan.
-                    if candidate is None and lost_count + 1 >= self.MAX_LOST_FRAMES_BEFORE_GLOBAL:
-                        recovered, recover_score = self._global_template_search(frame, template)
-                        if recovered is not None and recover_score >= 0.58:
-                            valid, app, why = self._valid_candidate(
-                                frame, recovered, predicted_box, last_valid_box, template,
-                                appearance_threshold=0.50
-                            )
-                            # Global recovery can be far from prediction; require appearance.
-                            if valid or app >= 0.60:
-                                candidate, score, state = recovered, max(app, recover_score), "TEMPLATE_RECOVERED"
-                    if candidate is not None:
+                # SORT-style prediction for each track. Optical flow provides a cheap measurement.
+                for tid, track in tracks.items():
+                    if track['lost'] > 0:
+                        track['lost'] += 1
+                    try:
+                        predicted = self._clip(frame, track['kalman'].predict())
+                    except Exception:
+                        predicted = self._clip(frame, track['roi'])
+                    track['predicted_roi'] = predicted
+                    previous_roi = tuple(track['roi'])
+                    points = track.get('points')
+                    flow_ok = False
+                    candidate = predicted
+                    flow_count = 0
+                    csrt_flow_delta = None
+                    # CSRT 每個影格更新一次，避免只靠光流造成框逐漸漂移。
+                    visual_tracker = track.get('visual_tracker')
+                    csrt_ok = False
+                    csrt_candidate = predicted
+                    if visual_tracker is not None:
                         try:
-                            tracker, tracker_label = self._create_tracker(self.tracker_name)
-                            tracker.init(frame, tuple(map(float, candidate)))
-                        except Exception as exc:
-                            self._report("tracker_reinit_error", f"重新初始化追蹤器失敗：{exc}", frame_no)
-
-                if candidate is not None:
-                    current_box = self._clip(frame, candidate)
-                    last_valid_box = current_box
-                    cx, cy = self._center(current_box)
-                    measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
-                    kalman.correct(measurement)
-                    lost_count = 0
-                    data[frame_no] = [current_box]
-                    tracked_count += 1
-                else:
-                    lost_count += 1
-                    state = "LOST"
-                    # Short one-frame grace: include last known box only briefly. It is marked
-                    # uncertain in the monitor; later LOST frames have no box in tracking_data.
-                    if lost_count <= self.UNCERTAIN_GRACE_FRAMES:
-                        data[frame_no] = [last_valid_box]
-                        state = "UNCERTAIN"
+                            ok_csrt, box_csrt = visual_tracker.update(frame)
+                            if ok_csrt:
+                                csrt_candidate = self._clip(frame, box_csrt)
+                                if csrt_candidate[2] >= 3 and csrt_candidate[3] >= 3:
+                                    candidate = csrt_candidate
+                                    flow_ok = True
+                                    csrt_ok = True
+                        except Exception:
+                            track['visual_tracker'] = None
+                    if points is not None and len(points) >= self.MIN_FEATURE_POINTS:
+                        try:
+                            new_points, status, _ = cv2.calcOpticalFlowPyrLK(
+                                previous_gray, current_gray, points, None,
+                                winSize=(21,21), maxLevel=3,
+                                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
+                            if new_points is not None and status is not None:
+                                good_old = points[status.reshape(-1) == 1]
+                                good_new = new_points[status.reshape(-1) == 1]
+                                flow_count = len(good_new)
+                                if flow_count >= self.MIN_FEATURE_POINTS:
+                                    delta = np.median(good_new - good_old, axis=0).reshape(-1)
+                                    dx, dy = float(delta[0]), float(delta[1])
+                                    flow_candidate = self._clip(frame, (previous_roi[0]+dx, previous_roi[1]+dy,
+                                                                          previous_roi[2], previous_roi[3]))
+                                    distance = math.hypot(dx, dy)
+                                    track['speed'] = .7*float(track['speed']) + .3*distance
+                                    if csrt_ok:
+                                        # 兩種視覺訊號接近時融合；差異大時以 CSRT 為主並交由外觀檢查把關。
+                                        cc, fc = self._center(csrt_candidate), self._center(flow_candidate)
+                                        csrt_flow_delta = math.hypot(cc[0]-fc[0], cc[1]-fc[1])
+                                        disagreement_gate = max(25.0, math.hypot(previous_roi[2], previous_roi[3]) * 0.5)
+                                        if csrt_flow_delta <= disagreement_gate:
+                                            candidate = tuple(int(round((a+b)/2.0)) for a,b in zip(csrt_candidate, flow_candidate))
+                                        else:
+                                            # When trackers disagree, prefer the candidate closer to
+                                            # Kalman's prediction; if both are implausible, reject it.
+                                            pred_center = self._center(predicted)
+                                            csrt_center = self._center(csrt_candidate)
+                                            flow_center = self._center(flow_candidate)
+                                            d_csrt = math.hypot(csrt_center[0]-pred_center[0], csrt_center[1]-pred_center[1])
+                                            d_flow = math.hypot(flow_center[0]-pred_center[0], flow_center[1]-pred_center[1])
+                                            candidate = csrt_candidate if d_csrt <= d_flow else flow_candidate
+                                            if min(d_csrt, d_flow) > max(32.0, math.hypot(previous_roi[2], previous_roi[3]) * 1.25):
+                                                flow_ok = False
+                                                track['loss_reason'] = 'tracker_disagreement'
+                                    else:
+                                        candidate = flow_candidate
+                                        flow_ok = True
+                                    track['points'] = good_new.reshape(-1,1,2).astype(np.float32)
+                        except cv2.error:
+                            flow_ok = csrt_ok
+                    diag = max(20.0, math.hypot(previous_roi[2], previous_roi[3]))
+                    # High-speed movement is allowed; the gate grows with measured velocity.
+                    max_move = max(45.0, diag*2.5, float(track['speed'])*2.2 + diag)
+                    old_c, new_c = self._center(previous_roi), self._center(candidate)
+                    pred_c = self._center(predicted)
+                    move = math.hypot(new_c[0]-old_c[0], new_c[1]-old_c[1])
+                    pred_distance = math.hypot(new_c[0]-pred_c[0], new_c[1]-pred_c[1])
+                    # Repeated identical objects can attract CSRT/KLT to the wrong instance.
+                    # Gate candidates against the motion prediction, not only the previous box.
+                    prediction_gate = max(32.0, diag * 1.25,
+                                          float(track['speed']) * 2.5 + diag * 0.5)
+                    if flow_ok and pred_distance > prediction_gate:
+                        flow_ok = False
+                        track['loss_reason'] = 'prediction_gate_rejected_possible_identity_switch'
+                    # 固定錨點避免錯誤框逐幀污染外觀模板。
+                    anchor = track.get('anchor_appearance')
+                    candidate_appearance = self._appearance(frame, candidate) if flow_ok else None
+                    anchor_score = self._appearance_score(anchor, candidate_appearance)
+                    blur_score = self._blur_score(frame, candidate)
+                    diag_info = {
+                        'fps': source_fps, 'target_displacement_px_frame': round(move, 2),
+                        'target_speed_px_sec': round(move * source_fps, 2) if source_fps else None,
+                        'global_motion_px_frame': round(global_motion, 2),
+                        'global_motion_dx': round(camera_dx, 2), 'global_motion_dy': round(camera_dy, 2),
+                        'camera_motion_suspected': bool(camera_moving),
+                        'flow_points': int(flow_count), 'csrt_ok': bool(csrt_ok),
+                        'csrt_flow_disagreement_px': round(csrt_flow_delta, 2) if csrt_flow_delta is not None else None,
+                        'blur_laplacian_variance': round(blur_score, 2),
+                        'appearance_score': round(anchor_score, 3),
+                    }
+                    track['last_diagnostics'] = diag_info
+                    if flow_ok and anchor is not None and anchor_score < 0.24:
+                        flow_ok = False
+                        track['loss_reason'] = 'appearance_mismatch'
+                    if flow_ok and move > max_move:
+                        track['loss_reason'] = 'large_displacement_gate'
+                    if not csrt_ok and flow_count < self.MIN_FEATURE_POINTS:
+                        track['loss_reason'] = 'few_features_or_motion_blur'
+                    if csrt_flow_delta is not None and csrt_flow_delta > max(25.0, diag * 0.5):
+                        track['loss_reason'] = 'tracker_disagreement'
+                    if camera_moving and move < global_motion * 0.35:
+                        track['loss_reason'] = 'possible_camera_motion'
+                    if source_fps and source_fps < 20.0 and move > diag * 0.8 and (flow_count < 8 or not csrt_ok):
+                        track['loss_reason'] = 'low_source_fps_plus_fast_motion'
+                    elif move > diag * 0.8 and (flow_count < 8 or not csrt_ok):
+                        track['loss_reason'] = 'possible_fast_target_motion'
+                    rx, ry, rw, rh = candidate
+                    if rx <= 1 or ry <= 1 or rx + rw >= frame_w - 1 or ry + rh >= frame_h - 1:
+                        track['loss_reason'] = 'roi_near_frame_edge_or_target_leaving_view'
+                    if blur_score < 35.0 and not csrt_ok:
+                        track['loss_reason'] = 'possible_motion_blur_or_low_texture'
+                    if flow_ok and move <= max_move:
+                        track['roi'] = candidate
+                        try:
+                            track['kalman'].correct(candidate)
+                        except Exception:
+                            track['kalman'] = SortMotionModel(candidate)
+                        track['lost'] = 0
+                        track['loss_reason'] = ''
+                        track['state'] = 'FAST_MOTION' if move > diag*.8 else 'TRACKING'
+                        track['appearance'] = self._appearance(frame, candidate)
                     else:
-                        data[frame_no] = []
+                        track['lost'] = max(1, track['lost'])
+                        track['state'] = 'LOST' if track['lost'] >= 3 else 'RECOVERY'
+                        reason = track.get('loss_reason') or 'tracker_measurement_failed'
+                        if track['lost'] == 1 or track['lost'] % 10 == 0:
+                            self._report('tracking_lost',
+                                f'ID {tid} 追蹤失敗，初步原因={reason}；位移={move:.1f}px/frame，'
+                                f'光流點={flow_count}，模糊分數={blur_score:.1f}，全畫面位移={global_motion:.1f}px/frame',
+                                frame_no, target_text=self.target_text, confidence=anchor_score,
+                                bbox=candidate, lost_count=track['lost'], patience=self.MAX_LOST_FRAMES,
+                                diagnosis=reason, diagnostics=diag_info, fps=source_fps,
+                                global_motion=global_motion, flow_points=flow_count,
+                                blur_score=blur_score, csrt_ok=csrt_ok,
+                                csrt_flow_disagreement=csrt_flow_delta)
+                        # Do not keep feeding a stale ROI back into CSRT: it can lock onto
+                        # another visually similar target and leave a misleading tracking box.
+                        track['visual_tracker'] = None
+                        track['points'] = None
+                        # Move the displayed recovery box with the Kalman prediction instead
+                        # of leaving a blue/stale box on the previously rejected object.
+                        track['roi'] = predicted
+                        need_local_recovery.append(tid)
 
-                if frame_no % self.MONITOR_INTERVAL == 0 or state in ("LOST", "UNCERTAIN", "OCR_RECOVERED"):
-                    self._draw_monitor(frame, frame_no, candidate if candidate is not None else (last_valid_box if state == "UNCERTAIN" else None),
-                                       state, score, tracker_label, reason)
-                if frame_no % self.PROGRESS_INTERVAL == 0:
-                    elapsed = time.monotonic() - frame_started
-                    self.progress_signal.emit(frame_no, f"混合追蹤 F{frame_no}/{self.total_frames} | {state} | {elapsed:.3f}s/frame")
-                    self._report("tracking", f"F{frame_no}/{self.total_frames} | {state}", frame_no,
-                                 tracker=tracker_label, score=score, lost_count=lost_count,
-                                 frame_elapsed_seconds=elapsed, reason=reason)
-                frame_no += 1
+                    # Replenish feature points in the current ROI to reduce drift / point depletion.
+                    if track['lost'] == 0 and (track.get('points') is None or len(track['points']) < 12 or frame_no % 5 == 0):
+                        track['points'] = self._features(current_gray, track['roi'])
 
-            success = (not cancelled) and bool(data) and any(bool(v) for v in data.values())
-            self._report("finished", "追蹤完成" if success else ("追蹤已取消" if cancelled else "未取得追蹤資料"),
-                         last_frame, tracked_frames=tracked_count, total_frames=len(data),
-                         tracker=tracker_label, success=success,
-                         lost_frames=sum(1 for v in data.values() if not v))
+                # OCR scheduling: periodic downscaled full-frame keyframes find targets that
+                # enter elsewhere in the image; local recovery handles fast short-term reacquisition.
+                should_global_ocr = (
+                    bool(self.target_text.strip())
+                    and (frame_no - hit_frame) % self.GLOBAL_OCR_INTERVAL == 0
+                )
+                recovery_due = []
+                for tid in need_local_recovery:
+                    tr = tracks[tid]
+                    attempts = int(tr.get('recovery_attempts', 0))
+                    retry_interval = min(120, self.LOCAL_RECOVERY_INTERVAL * (2 ** min(attempts // 2, 3)))
+                    if frame_no - int(tr.get('last_local_search_frame', -10**9)) >= retry_interval:
+                        recovery_due.append(tid)
+
+                if reader is not None:
+                    # Full-frame OCR only at sparse keyframes (default every 45 frames),
+                    # resized to at most 960 px. This is necessary to find a target that
+                    # appears outside the selected object's local search area.
+                    if should_global_ocr:
+                        global_detections, _ = self._ocr(
+                            reader, frame, frame_no, full_frame=True, robust=False)
+                        detections.extend(global_detections)
+                        ran_ocr = True
+                        # If the requested text is confidently found far away from an
+                        # active visual track, do not let a stale CSRT box remain blue
+                        # on a visually similar but text-mismatched object. The OCR hit
+                        # will be associated or become a fresh track below.
+                        if global_detections:
+                            for tid, tr in tracks.items():
+                                if tr.get('lost', 0) > 0:
+                                    continue
+                                tracked_box = tr.get('predicted_roi') or tr['roi']
+                                tc = self._center(tracked_box)
+                                td = math.hypot(tracked_box[2], tracked_box[3])
+                                far_match = True
+                                for det_box, _det_text, _det_conf in global_detections:
+                                    dc = self._center(det_box)
+                                    if math.hypot(tc[0]-dc[0], tc[1]-dc[1]) <= max(100.0, td * 1.5):
+                                        far_match = False
+                                        break
+                                if far_match:
+                                    tr['lost'] = 1
+                                    tr['state'] = 'RECOVERY'
+                                    tr['loss_reason'] = 'global_ocr_found_target_elsewhere'
+                                    tr['visual_tracker'] = None
+                                    tr['points'] = None
+                                    tr['roi'] = tracked_box
+                                    if tid not in need_local_recovery:
+                                        need_local_recovery.append(tid)
+                    # Avoid duplicate local OCR on a frame that already had a global scan.
+                    if recovery_due and not should_global_ocr:
+                        for tid in recovery_due:
+                            track = tracks[tid]
+                            pred = track.get('predicted_roi') or track['roi']
+                            local_roi = self._expand_roi(frame, pred, self.RECOVERY_SCALE)
+                            track['last_local_search_frame'] = frame_no
+                            track['recovery_attempts'] = int(track.get('recovery_attempts', 0)) + 1
+                            robust_ocr = track['recovery_attempts'] % 3 == 0
+                            local, _ = self._ocr(reader, frame, frame_no, roi=local_roi, robust=robust_ocr)
+                            detections.extend(local)
+                            ran_ocr = True
+
+                # Hungarian matching (SORT association) between OCR boxes and predicted tracks.
+                if detections and tracks:
+                    tids = list(tracks.keys())
+                    cost = np.full((len(tids), len(detections)), 1e6, dtype=np.float64)
+                    for i, tid in enumerate(tids):
+                        tr = tracks[tid]
+                        pred = tr.get('predicted_roi') or tr['roi']
+                        pc = self._center(pred)
+                        gate = max(35.0, math.hypot(pred[2], pred[3])*1.75 + tr['speed']*1.5)
+                        for j, det in enumerate(detections):
+                            box, text, conf = det
+                            dc = self._center(box)
+                            dist = math.hypot(pc[0]-dc[0], pc[1]-dc[1])
+                            iou = self._iou(pred, box)
+                            app = self._appearance_score(tr.get('appearance'), self._appearance(frame, box))
+                            text_match = (not self.target_text.strip() or
+                                self._normalize(self.target_text) in self._normalize(text))
+                            # Do not associate a distant same-text detection solely because
+                            # the text looks alike. It must be close to the motion prediction
+                            # or have meaningful box overlap.
+                            if (dist <= gate and (iou >= .02 or dist <= gate * .70 or app >= .72)) or iou >= .15:
+                                cost[i,j] = .55*(1-iou) + .30*min(1.0, dist/gate) + .10*(1-app) + .05*(1-conf)
+                                if not text_match:
+                                    cost[i,j] += .5
+                    if linear_sum_assignment is not None:
+                        rows, cols = linear_sum_assignment(cost)
+                        pairs = list(zip(rows.tolist(), cols.tolist()))
+                    else:
+                        pairs = sorted(((cost[i,j],i,j) for i in range(cost.shape[0]) for j in range(cost.shape[1])))
+                        used_i, used_j, greedy = set(), set(), []
+                        for c,i,j in pairs:
+                            if c < .82 and i not in used_i and j not in used_j:
+                                greedy.append((i,j)); used_i.add(i); used_j.add(j)
+                        pairs = greedy
+                    used_dets = set()
+                    for i,j in pairs:
+                        if cost[i,j] >= .82:
+                            continue
+                        tid = tids[i]
+                        box, text, conf = detections[j]
+                        tr = tracks[tid]
+                        old_center, new_center = self._center(tr['roi']), self._center(box)
+                        moved = math.hypot(new_center[0]-old_center[0], new_center[1]-old_center[1])
+                        corrected_box = self._clip(frame, box)
+                        tr.update({'roi': corrected_box, 'predicted_roi': corrected_box,
+                                   'visual_tracker': self._create_visual_tracker(frame, corrected_box),
+                                   'lost': 0, 'state': 'OCR_CONFIRMED', 'text': text,
+                                   'confidence': conf, 'speed': .7*tr['speed']+.3*moved,
+                                   'last_seen_frame': frame_no, 'last_ocr_frame': frame_no,
+                                   'last_local_search_frame': frame_no, 'recovery_attempts': 0,
+                                   'appearance': self._appearance(frame, box),
+                                   'points': self._features(current_gray, self._clip(frame, box))})
+                        try:
+                            tr['kalman'].correct(box)
+                        except Exception:
+                            tr['kalman'] = SortMotionModel(box)
+                        used_dets.add(j)
+                    # Additional OCR instances become new tracks, but manual single ROI mode
+                    # only creates new IDs when OCR matches the requested target text.
+                    for j, det in enumerate(detections):
+                        if j in used_dets:
+                            continue
+                        if any(self._iou(det[0], tr['roi']) > .80 for tr in tracks.values()):
+                            continue
+                        if self.target_text.strip() and self._normalize(self.target_text) not in self._normalize(det[1]):
+                            continue
+                        tracks[next_id] = self._new_track(frame, det[0], next_id, frame_no, det[1], det[2])
+                        history[next_id] = {}
+                        next_id += 1
+
+                # Export masks for live tracks. During a short loss, use a growing
+                # conservative mask around the Kalman prediction instead of exposing
+                # the target immediately. Long losses are marked for manual review.
+                frame_rois, monitor_tracks = [], {}
+                for tid, tr in tracks.items():
+                    if tr['lost'] > self.MAX_LOST_FRAMES:
+                        continue
+                    roi = tuple(map(int, self._clip(frame, tr['roi'])))
+                    monitor_tracks[tid] = tr
+                    mask_roi = None
+                    if tr['lost'] == 0:
+                        mask_roi = roi
+                    elif tr['lost'] <= self.CONSERVATIVE_MASK_FRAMES:
+                        predicted_roi = tr.get('predicted_roi') or tr['roi']
+                        px, py, pw, ph = self._clip(frame, predicted_roi)
+                        cx, cy = px + pw / 2.0, py + ph / 2.0
+                        scale = 1.0 + 0.18 * tr['lost']
+                        mask_roi = self._clip(frame, (cx-pw*scale/2, cy-ph*scale/2,
+                                                      pw*scale, ph*scale))
+                    history.setdefault(tid, {})[frame_no] = mask_roi
+                    if mask_roi is not None and not any(self._iou(mask_roi, old) > .88 for old in frame_rois):
+                        frame_rois.append(tuple(map(int, mask_roi)))
+                data[frame_no] = frame_rois
+                if frame_no % self.MONITOR_INTERVAL == 0 or ran_ocr or need_local_recovery:
+                    self._draw_monitor(frame, frame_no, monitor_tracks, 'RECOVERY MODE' if need_local_recovery else 'TRACK MODE')
+                if ran_ocr or need_local_recovery:
+                    diagnostic_tracks = [t for t in tracks.values() if t.get('lost', 0) > 0]
+                    diagnosis = ', '.join(f"ID {t['id']}:{t.get('loss_reason') or 'recovering'}" for t in diagnostic_tracks[:4])
+                    summary = f'；失追診斷={diagnosis}' if diagnosis else ''
+                    self._report('tracking', f'影格 {frame_no}：追蹤 {len(tracks)}，局部恢復 {len(need_local_recovery)}，OCR 框 {len(detections)}{summary}',
+                                 frame_no, target_count=len(tracks), lost_count=len(need_local_recovery),
+                                 detection_count=len(detections), diagnosis=diagnosis,
+                                 global_motion=global_motion, camera_motion_suspected=camera_moving,
+                                 fps=source_fps, mode='RECOVERY MODE' if need_local_recovery else 'TRACK MODE')
+                self.progress_signal.emit(frame_no, f'TRACK F{frame_no}/{end_frame}，有效框 {len(frame_rois)}')
+                previous_gray = current_gray
+
+            self._interpolate_short_gaps(history, self.INTERPOLATE_MAX_GAP)
+            for f in range(hit_frame, last_frame+1):
+                rois = list(data.get(f, []))
+                for th in history.values():
+                    roi = th.get(f)
+                    if roi is not None and not any(self._iou(roi, old) > .88 for old in rois):
+                        rois.append(tuple(map(int, roi)))
+                data[f] = rois
+            success = any(bool(v) for v in data.values())
+            self._report('finished', '追蹤完成', last_frame, tracked_frames=len(data),
+                         target_count=max((len(v) for v in data.values()), default=0), success=success)
         except Exception as exc:
-            self._report("error", f"執行錯誤：{type(exc).__name__}: {exc}", last_frame)
-            success = (not cancelled) and bool(data) and any(bool(v) for v in data.values())
+            self._report('error', f'執行錯誤：{type(exc).__name__}: {exc}', last_frame)
+            success = any(bool(v) for v in data.values())
         finally:
             if cap is not None:
                 cap.release()
@@ -589,33 +848,26 @@ class OCRTrackingThread(QThread):
 
 
 class VideoProcessorThread(QThread):
-    """Frame-accurate mosaic exporter compatible with existing GUI task format."""
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(str)
 
     def __init__(self, video_path, output_path, mosaic_tasks):
         super().__init__()
-        self.video_path = video_path
-        self.output_path = output_path
-        self.mosaic_tasks = mosaic_tasks
+        self.video_path, self.output_path, self.mosaic_tasks = video_path, output_path, mosaic_tasks
 
     @staticmethod
     def _apply_mosaic(frame, roi, strength):
         height, width = frame.shape[:2]
         x, y, w, h = [int(round(float(v))) for v in roi]
-        x = max(0, min(x, width - 1))
-        y = max(0, min(y, height - 1))
-        w = max(0, min(w, width - x))
-        h = max(0, min(h, height - y))
+        x = max(0, min(x, width - 1)); y = max(0, min(y, height - 1))
+        w = max(0, min(w, width - x)); h = max(0, min(h, height - y))
         if w <= 0 or h <= 0:
             return
         area = frame[y:y+h, x:x+w]
         strength = max(1, int(strength))
         sw, sh = max(1, w // strength), max(1, h // strength)
-        frame[y:y+h, x:x+w] = cv2.resize(
-            cv2.resize(area, (sw, sh), interpolation=cv2.INTER_LINEAR),
-            (w, h), interpolation=cv2.INTER_NEAREST
-        )
+        frame[y:y+h, x:x+w] = cv2.resize(cv2.resize(area, (sw, sh), interpolation=cv2.INTER_LINEAR),
+                                           (w, h), interpolation=cv2.INTER_NEAREST)
 
     @staticmethod
     def _rois_for_frame(task, frame_no):
@@ -625,33 +877,23 @@ class VideoProcessorThread(QThread):
         value = task.get("tracking_data", {}).get(frame_no)
         if value is None:
             return []
-        if isinstance(value, (tuple, list)) and len(value) == 4 and all(
-                isinstance(v, (int, float)) for v in value):
+        if isinstance(value, (tuple, list)) and len(value) == 4 and all(isinstance(v, (int, float)) for v in value):
             return [value]
-        return list(value) if isinstance(value, (tuple, list)) else []
+        return list(value) if isinstance(value, (list, tuple)) else []
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            self.finished_signal.emit("")
-            return
+            self.finished_signal.emit(""); return
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         if not out.isOpened():
-            cap.release()
-            self.finished_signal.emit("")
-            return
+            cap.release(); self.finished_signal.emit(""); return
         current = 0
-        ok_output = True
         try:
             while True:
-                if self.isInterruptionRequested():
-                    ok_output = False
-                    break
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -665,8 +907,7 @@ class VideoProcessorThread(QThread):
                     self.progress_signal.emit(current, total)
             self.progress_signal.emit(current, total)
         except Exception:
-            ok_output = False
+            self.finished_signal.emit(""); return
         finally:
-            cap.release()
-            out.release()
-        self.finished_signal.emit(self.output_path if ok_output and current > 0 else "")
+            cap.release(); out.release()
+        self.finished_signal.emit(self.output_path)

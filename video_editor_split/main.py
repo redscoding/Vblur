@@ -1,23 +1,59 @@
+
 import sys
 import os
 import time
+
+# ==================================================
+# 1. 先載入 OCR / ONNX Runtime
+#    必須放在 PyQt5 前面
+# ==================================================
+import onnxruntime
+from rapidocr_onnxruntime import RapidOCR
+
+# ==================================================
+# 2. 再載入 OpenCV
+# ==================================================
 import cv2
-import easyocr  # 請維持在 PyQt5 GUI 元件之前載入，降低 Windows DLL 衝突機率
+
+# ==================================================
+# 3. 設定 PyQt5 的 Qt 外掛路徑
+#    設定好環境變數後再匯入 Qt Widgets
+# ==================================================
 import PyQt5
 
-plugin_path = os.path.join(os.path.dirname(PyQt5.__file__), "Qt5", "plugins")
-os.environ["QT_PLUGIN_PATH"] = plugin_path
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugin_path, "platforms")
-
-from video_processor import OCRTrackingThread, VideoProcessorThread
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSlider, QFileDialog, QMessageBox, QGroupBox, QSpinBox, QFrame,
-    QListWidget, QAbstractItemView, QLineEdit, QProgressDialog, QDialog,
-    QProgressBar, QSplitter
+plugin_path = os.path.join(
+    os.path.dirname(PyQt5.__file__),
+    "Qt5",
+    "plugins"
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
+
+os.environ["QT_PLUGIN_PATH"] = plugin_path
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
+    plugin_path,
+    "platforms"
+)
+
+# ==================================================
+# 4. 最後載入自己的影片處理模組與 PyQt5
+# ==================================================
+from video_processor import OCRTrackingThread, VideoProcessorThread
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QSlider, QFileDialog, QMessageBox,
+    QGroupBox, QSpinBox, QFrame,
+    QListWidget, QAbstractItemView, QLineEdit,
+    QProgressDialog, QDialog, QProgressBar,
+    QSplitter
+)
+
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+
+from PyQt5.QtGui import (
+    QImage, QPixmap, QPainter, QColor, QPen
+)
+
 
 
 MODERN_THEME = """
@@ -42,153 +78,133 @@ QProgressBar::chunk { background-color: #0E639C; }
 
 
 class VideoDisplayWidget(QWidget):
+    """影片預覽元件，支援在縮放後的預覽畫面上框選原始影格 ROI。"""
+    roi_selected = pyqtSignal(tuple)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pixmap = None
+        self.selection_enabled = False
+        self.drag_start = None
+        self.drag_end = None
+        self.selected_roi = None  # 原始影片影格座標 (x, y, w, h)
         self.setMinimumSize(400, 300)
+        self.setMouseTracking(True)
 
     def set_image(self, pixmap):
         self.pixmap = pixmap
         self.update()
 
+    def set_selection_mode(self, enabled=True):
+        self.selection_enabled = bool(enabled)
+        self.drag_start = None
+        self.drag_end = None
+        if enabled:
+            self.selected_roi = None
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def clear_selection(self):
+        self.selection_enabled = False
+        self.drag_start = None
+        self.drag_end = None
+        self.selected_roi = None
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def _display_geometry(self):
+        """回傳預覽影像在 widget 中的實際顯示矩形 (left, top, width, height)。"""
+        if self.pixmap is None or self.pixmap.width() <= 0 or self.pixmap.height() <= 0:
+            return 0, 0, 0, 0
+        scale = min(self.width() / self.pixmap.width(), self.height() / self.pixmap.height())
+        width = max(1, int(round(self.pixmap.width() * scale)))
+        height = max(1, int(round(self.pixmap.height() * scale)))
+        return (self.width() - width) // 2, (self.height() - height) // 2, width, height
+
+    def _clamp_to_image(self, point):
+        left, top, width, height = self._display_geometry()
+        if width <= 0 or height <= 0:
+            return None
+        x = max(left, min(int(point[0]), left + width - 1))
+        y = max(top, min(int(point[1]), top + height - 1))
+        return x, y
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#000000"))
-        if self.pixmap:
-            scaled = self.pixmap.scaled(self.width(), self.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap((self.width() - scaled.width()) // 2,
-                               (self.height() - scaled.height()) // 2, scaled)
+        if self.pixmap is None:
+            return
 
+        left, top, width, height = self._display_geometry()
+        scaled = self.pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        painter.drawPixmap(left, top, scaled)
 
+        # 已確認的 ROI 以綠框顯示；座標保存在原始影格座標，因此縮放視窗也不會偏移。
+        if self.selected_roi is not None:
+            x, y, rw, rh = self.selected_roi
+            sx, sy = width / self.pixmap.width(), height / self.pixmap.height()
+            painter.setPen(QPen(QColor("#00E676"), 2))
+            painter.drawRect(int(left + x * sx), int(top + y * sy),
+                             max(1, int(rw * sx)), max(1, int(rh * sy)))
 
-class ROISelectionWidget(QWidget):
-    """Qt-native ROI selector; avoids cv2.selectROI / OpenCV HighGUI dependencies."""
-    def __init__(self, frame, parent=None):
-        super().__init__(parent)
-        self.frame_h, self.frame_w = frame.shape[:2]
-        self.pixmap = frame_to_pixmap(frame)
-        self.start_point = None
-        self.end_point = None
-        self.dragging = False
-        self.selected_roi = None
-        self.setMinimumSize(640, 360)
-        self.setMouseTracking(True)
-
-    def _image_rect(self):
-        if self.pixmap is None or self.width() <= 0 or self.height() <= 0:
-            return None
-        scaled = self.pixmap.size()
-        scaled.scale(self.size(), Qt.KeepAspectRatio)
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
-        return x, y, scaled.width(), scaled.height()
-
-    def _widget_to_image(self, point):
-        rect = self._image_rect()
-        if rect is None:
-            return None
-        x0, y0, dw, dh = rect
-        px, py = point.x(), point.y()
-        if px < x0 or py < y0 or px > x0 + dw or py > y0 + dh:
-            return None
-        ix = int(round((px - x0) * self.frame_w / max(1, dw)))
-        iy = int(round((py - y0) * self.frame_h / max(1, dh)))
-        return (max(0, min(ix, self.frame_w - 1)),
-                max(0, min(iy, self.frame_h - 1)))
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#101010"))
-        rect = self._image_rect()
-        if rect is not None:
-            x, y, w, h = rect
-            scaled = self.pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap(x, y, scaled)
-        if self.start_point and self.end_point:
-            left = min(self.start_point.x(), self.end_point.x())
-            top = min(self.start_point.y(), self.end_point.y())
-            right = max(self.start_point.x(), self.end_point.x())
-            bottom = max(self.start_point.y(), self.end_point.y())
-            painter.setPen(QColor("#00FF70"))
-            painter.drawRect(left, top, right - left, bottom - top)
-            painter.fillRect(left, top, right - left, bottom - top, QColor(0, 255, 112, 35))
+        if self.selection_enabled and self.drag_start is not None and self.drag_end is not None:
+            x1, y1 = self.drag_start
+            x2, y2 = self.drag_end
+            painter.setPen(QPen(QColor("#FFD54F"), 2, Qt.DashLine))
+            painter.drawRect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
+        if not self.selection_enabled or self.pixmap is None or event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        point = self._clamp_to_image((event.x(), event.y()))
+        left, top, width, height = self._display_geometry()
+        if point is None or not (left <= event.x() < left + width and top <= event.y() < top + height):
             return
-        if self._widget_to_image(event.pos()) is None:
-            return
-        self.start_point = event.pos()
-        self.end_point = event.pos()
-        self.dragging = True
+        self.drag_start = point
+        self.drag_end = point
         self.selected_roi = None
         self.update()
 
     def mouseMoveEvent(self, event):
-        if self.dragging:
-            self.end_point = event.pos()
+        if self.selection_enabled and self.drag_start is not None:
+            self.drag_end = self._clamp_to_image((event.x(), event.y()))
             self.update()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() != Qt.LeftButton or not self.dragging:
+        if not self.selection_enabled or self.drag_start is None or event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        self.drag_end = self._clamp_to_image((event.x(), event.y()))
+        left, top, width, height = self._display_geometry()
+        if self.drag_end is None or width <= 0 or height <= 0:
+            self.clear_selection()
             return
-        self.end_point = event.pos()
-        self.dragging = False
-        p1 = self._widget_to_image(self.start_point)
-        p2 = self._widget_to_image(self.end_point)
-        if p1 and p2:
-            x1, y1 = p1
-            x2, y2 = p2
-            x, y = min(x1, x2), min(y1, y2)
-            w, h = abs(x2 - x1), abs(y2 - y1)
-            if w >= 4 and h >= 4:
-                self.selected_roi = (x, y, w, h)
+        x1, y1 = self.drag_start
+        x2, y2 = self.drag_end
+        display_x, display_y = min(x1, x2), min(y1, y2)
+        display_w, display_h = abs(x2 - x1), abs(y2 - y1)
+        if display_w < 4 or display_h < 4:
+            self.clear_selection()
+            return
+        sx, sy = self.pixmap.width() / width, self.pixmap.height() / height
+        x = int(round((display_x - left) * sx))
+        y = int(round((display_y - top) * sy))
+        rw = int(round(display_w * sx))
+        rh = int(round(display_h * sy))
+        x = max(0, min(x, self.pixmap.width() - 1))
+        y = max(0, min(y, self.pixmap.height() - 1))
+        rw = max(1, min(rw, self.pixmap.width() - x))
+        rh = max(1, min(rh, self.pixmap.height() - y))
+        self.selected_roi = (x, y, rw, rh)
+        self.selection_enabled = False
+        self.drag_start = None
+        self.drag_end = None
+        self.setCursor(Qt.ArrowCursor)
         self.update()
-
-    def get_roi(self):
-        return self.selected_roi
-
-
-class ROISelectionDialog(QDialog):
-    """A modal selection dialog rendered by Qt, independent of OpenCV GUI support."""
-    def __init__(self, frame, parent=None, title="框選目標"):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(1000, 720)
-        self.setMinimumSize(680, 440)
-        self.setStyleSheet(MODERN_THEME)
-        layout = QVBoxLayout(self)
-        self.selector = ROISelectionWidget(frame, self)
-        layout.addWidget(self.selector, 1)
-        tip = QLabel("用滑鼠左鍵拖曳框選目標；綠框為選取範圍。按「確認」完成，按「取消」放棄。")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.btn_cancel = QPushButton("取消")
-        self.btn_ok = QPushButton("確認框選")
-        self.btn_ok.setObjectName("primary")
-        self.btn_cancel.clicked.connect(self.reject)
-        self.btn_ok.clicked.connect(self._accept_if_valid)
-        buttons.addWidget(self.btn_cancel)
-        buttons.addWidget(self.btn_ok)
-        layout.addLayout(buttons)
-
-    def _accept_if_valid(self):
-        if self.selector.get_roi() is None:
-            QMessageBox.warning(self, "尚未框選", "請先用滑鼠拖曳框出目標區域。")
-            return
-        self.accept()
-
-    def get_roi(self):
-        return self.selector.get_roi()
-
-
-def select_roi_dialog(frame, parent=None, title="框選目標"):
-    dialog = ROISelectionDialog(frame, parent, title)
-    if dialog.exec_() == QDialog.Accepted:
-        return dialog.get_roi()
-    return None
+        self.roi_selected.emit(self.selected_roi)
 
 
 def frame_to_pixmap(frame):
@@ -338,6 +354,8 @@ class ProVideoEditor(QMainWindow):
         self.video_path, self.cap, self.is_playing = None, None, False
         self.total_frames, self.current_frame = 0, 0
         self.current_raw_frame = None
+        self.selected_tracking_roi = None
+        self.selected_tracking_frame = None
         self.mosaic_tasks = []
         self.ocr_thread = None
         self.monitor_dialog = None
@@ -365,10 +383,18 @@ class ProVideoEditor(QMainWindow):
 
         group_mosaic = QGroupBox("2. Mosaic Segments (混合追蹤段落)")
         mosaic_layout = QVBoxLayout(group_mosaic)
+        self.btn_select_tracking = QPushButton("🎯 框選 AI 追蹤目標")
+        self.btn_select_tracking.setEnabled(False)
+        self.btn_select_tracking.clicked.connect(self.begin_tracking_selection)
+        mosaic_layout.addWidget(self.btn_select_tracking)
+        self.lbl_tracking_selection = QLabel("AI 追蹤目標：尚未框選（請先框選；不執行全畫面 OCR）")
+        self.lbl_tracking_selection.setWordWrap(True)
+        mosaic_layout.addWidget(self.lbl_tracking_selection)
+
         ocr_row = QHBoxLayout()
         self.txt_ocr = QLineEdit()
-        self.txt_ocr.setPlaceholderText("選填：目標文字（追蹤失效時才用 OCR 補救）")
-        self.btn_ocr = QPushButton("🎯 手動框選並追蹤")
+        self.txt_ocr.setPlaceholderText("輸入目標文字 (如：車牌)")
+        self.btn_ocr = QPushButton("🔤 掃描並追蹤")
         self.btn_ocr.setObjectName("primary")
         self.btn_ocr.setEnabled(False)
         self.btn_ocr.clicked.connect(self.start_ocr_tracking)
@@ -435,6 +461,7 @@ class ProVideoEditor(QMainWindow):
 
         right_panel = QVBoxLayout()
         self.video_display = VideoDisplayWidget()
+        self.video_display.roi_selected.connect(self.on_tracking_roi_selected)
         control = QHBoxLayout()
         self.btn_play = QPushButton("▶ Play")
         self.btn_play.setFixedWidth(80)
@@ -460,6 +487,7 @@ class ProVideoEditor(QMainWindow):
         if self.cap:
             self.cap.release()
         self.video_path = file_name
+        self.clear_tracking_selection()
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
             QMessageBox.warning(self, "讀取失敗", "無法開啟這個影片檔案。")
@@ -469,6 +497,7 @@ class ProVideoEditor(QMainWindow):
         self.current_frame = 0
         self.slider.setRange(0, max(0, self.total_frames - 1))
         self.btn_add_task.setEnabled(True)
+        self.btn_select_tracking.setEnabled(True)
         self.btn_ocr.setEnabled(True)
         self.btn_export.setEnabled(True)
         self.update_time_label()
@@ -490,7 +519,10 @@ class ProVideoEditor(QMainWindow):
         if self.cap:
             ret, frame = self.cap.read()
             if ret:
-                self.current_frame = max(0, int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+                new_frame_no = max(0, int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+                if self.selected_tracking_frame is not None and new_frame_no != self.selected_tracking_frame:
+                    self.clear_tracking_selection()
+                self.current_frame = new_frame_no
                 self.current_raw_frame = frame.copy()
                 self.slider.blockSignals(True)
                 self.slider.setValue(self.current_frame)
@@ -504,6 +536,8 @@ class ProVideoEditor(QMainWindow):
 
     def set_position(self, position):
         if self.cap:
+            if self.selected_tracking_frame is not None and int(position) != self.selected_tracking_frame:
+                self.clear_tracking_selection()
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, position)
             self.current_frame = position
             self.read_and_display_frame()
@@ -562,37 +596,73 @@ class ProVideoEditor(QMainWindow):
         total_seconds = int(self.total_frames / fps)
         self.lbl_time.setText(f"{current_seconds // 60:02d}:{current_seconds % 60:02d} / {total_seconds // 60:02d}:{total_seconds % 60:02d}")
 
+    def begin_tracking_selection(self):
+        """暫停影片並在右側預覽畫面啟用滑鼠拖曳框選。"""
+        if self.current_raw_frame is None or not self.video_path:
+            QMessageBox.information(self, "尚未載入影片", "請先匯入影片，再選擇要追蹤的影格。")
+            return
+        if self.is_playing:
+            self.toggle_play()
+        self.selected_tracking_roi = None
+        self.selected_tracking_frame = None
+        self.video_display.set_selection_mode(True)
+        self.lbl_tracking_selection.setText("請在右側影片預覽畫面按住滑鼠左鍵拖曳，框住目標後放開。")
+        self.lbl_status.setText(f"Status: 請在影格 F{self.current_frame} 框選 AI 追蹤目標")
+
+    def on_tracking_roi_selected(self, roi):
+        self.selected_tracking_roi = tuple(int(v) for v in roi)
+        self.selected_tracking_frame = int(self.current_frame)
+        self.lbl_tracking_selection.setText(
+            f"AI 追蹤目標：F{self.selected_tracking_frame}，ROI={self.selected_tracking_roi}（原始影格座標）"
+        )
+        self.lbl_status.setText("Status: 已框選目標；輸入目標文字後按「掃描並追蹤」開始。")
+
+    def clear_tracking_selection(self):
+        self.selected_tracking_roi = None
+        self.selected_tracking_frame = None
+        if hasattr(self, "video_display"):
+            self.video_display.clear_selection()
+        if hasattr(self, "lbl_tracking_selection"):
+            self.lbl_tracking_selection.setText("AI 追蹤目標：尚未框選（請先框選；不執行全畫面 OCR）")
+
     def start_ocr_tracking(self):
-        if not self.video_path or self.current_raw_frame is None:
+        target = self.txt_ocr.text().strip()
+        if not self.video_path:
             QMessageBox.warning(self, "尚未匯入影片", "請先匯入影片。")
             return
         if self.ocr_thread and self.ocr_thread.isRunning():
-            QMessageBox.information(self, "正在執行", "目前已有一個追蹤工作在執行。")
+            QMessageBox.information(self, "正在執行", "目前已有一個 OCR 追蹤工作在執行。")
             return
         if self.is_playing:
             self.toggle_play()
 
-        roi = select_roi_dialog(
-            self.current_raw_frame, self,
-            title="手動框選追蹤目標（拖曳滑鼠後按確認）"
-        )
-        if roi is None:
-            self.lbl_status.setText("Status: 已取消手動框選")
+        initial_roi = None
+        if self.selected_tracking_roi is not None:
+            if self.selected_tracking_frame != self.current_frame:
+                self.clear_tracking_selection()
+                QMessageBox.warning(self, "框選影格已變更", "你已切換到其他影格，請重新框選目標後再開始追蹤。")
+                return
+            initial_roi = self.selected_tracking_roi
+        if initial_roi is None:
+            QMessageBox.warning(self, "尚未框選目標", "此效能版禁止全畫面 OCR。請先按框選追蹤目標，在預覽畫面拖曳框住單一目標，再開始追蹤。")
             return
+        if not target:
+            answer = QMessageBox.question(
+                self, "未輸入文字", "未輸入目標文字時，系統只使用 CSRT／光流／Kalman 追蹤，不會執行 OCR 驗證。要繼續嗎？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
 
-        target = self.txt_ocr.text().strip()
         self.monitor_dialog = OCRMonitorDialog(self)
         self.monitor_dialog.show()
-        self.progress_dialog = QProgressDialog(
-            "正在啟動快速追蹤...", "取消追蹤", self.current_frame,
-            max(self.current_frame + 1, self.total_frames), self
-        )
-        self.progress_dialog.setWindowTitle("Manual Fast Tracking")
+        self.progress_dialog = QProgressDialog("正在啟動 AI 引擎...", "取消追蹤", self.current_frame,
+                                                max(self.current_frame + 1, self.total_frames), self)
+        self.progress_dialog.setWindowTitle("OCR Tracking")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setAutoClose(False)
         self.ocr_thread = OCRTrackingThread(
-            self.video_path, self.current_frame, self.total_frames,
-            target_text=target, initial_roi=tuple(map(int, roi)), tracker_name="KCF"
+            self.video_path, self.current_frame, self.total_frames, target,
+            initial_roi=initial_roi
         )
         self.progress_dialog.canceled.connect(self.ocr_thread.requestInterruption)
         self.ocr_thread.progress_signal.connect(self.update_ocr_progress)
@@ -614,7 +684,7 @@ class ProVideoEditor(QMainWindow):
             self.progress_dialog.close()
         self.btn_ocr.setEnabled(bool(self.video_path))
         if not success or not tracking_data:
-            QMessageBox.warning(self, "追蹤未完成", "沒有取得完整的追蹤結果，或工作已取消。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。")
+            QMessageBox.warning(self, "追蹤未完成", "沒有取得可用的追蹤資料。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。")
             self.lbl_status.setText("Status: OCR tracking failed")
             return
         task = {
@@ -629,7 +699,7 @@ class ProVideoEditor(QMainWindow):
         self.list_tasks.setCurrentRow(len(self.mosaic_tasks) - 1)
         self.refresh_display()
         max_targets = max((len(v) if isinstance(v, (list, tuple)) and not (len(v) == 4 and all(isinstance(x, (int, float)) for x in v)) else (1 if v else 0) for v in tracking_data.values()), default=0)
-        self.lbl_status.setText(f"Status: 手動目標追蹤完成；最後影格 F{last_frame}；請檢查監控與輸出結果")
+        self.lbl_status.setText(f"Status: 多目標追蹤完成，最多同時 {max_targets} 個框；最後影格 F{last_frame}")
         if self.monitor_dialog:
             self.monitor_dialog.raise_()
             self.monitor_dialog.activateWindow()
@@ -639,10 +709,9 @@ class ProVideoEditor(QMainWindow):
             return
         if self.is_playing:
             self.toggle_play()
-        roi = select_roi_dialog(
-            self.current_raw_frame, self,
-            title="手動框選固定馬賽克區域"
-        )
+        QMessageBox.information(self, "操作提示", "請框選要固定打碼的區域，畫完按 ENTER。")
+        roi = cv2.selectROI("Select ROI", self.current_raw_frame, fromCenter=False, showCrosshair=True)
+        cv2.destroyAllWindows()
         if roi and roi[2] > 0 and roi[3] > 0:
             self.mosaic_tasks.append({"type": "static", "start": self.current_frame,
                                      "end": max(0, self.total_frames - 1), "roi": tuple(map(int, roi)), "strength": 15})
