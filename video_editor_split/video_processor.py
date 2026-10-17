@@ -106,10 +106,10 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 45          # full-frame target search about every 1.5 s at 30 FPS
+    GLOBAL_OCR_INTERVAL = 15          # 全畫面 OCR 每 15 幀一次（30 FPS 約 0.5 秒）
     LOCAL_RECOVERY_INTERVAL = 12      # local ROI retry (~0.4 s at 30 FPS), with backoff
-    MAX_OCR_ROI_DIM = 640             # bound local OCR input dimensions for speed
-    MAX_GLOBAL_OCR_DIM = 960          # downscale full-frame keyframes to this max dimension
+    MAX_OCR_ROI_DIM = 800             # 局部 OCR 保留較多小字細節
+    MAX_GLOBAL_OCR_DIM = 1280         # 減少小字在全畫面縮放時的細節損失
     MIN_FEATURE_POINTS = 4
     MAX_LOST_FRAMES = 3  # 達 3 幀仍失追就停止輸出該軌跡的馬賽克框
     CONSERVATIVE_MASK_FRAMES = 5  # 短暫失追時使用擴大的 Kalman 預測框，降低漏遮罩風險
@@ -410,6 +410,33 @@ class OCRTrackingThread(QThread):
                     cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2, cv2.LINE_AA)
         self.monitor_frame_signal.emit(shown, int(frame_no), mode)
 
+    def _draw_reverse_check(self, frame, frame_no, track_id, predicted_roi=None,
+                            measured_roi=None, note="反向檢查中"):
+        """在 GUI 即時監控顯示反向檢查實際讀取的影格。
+
+        橘框=反向追蹤預測搜尋位置；綠框=OCR 確認位置。
+        frame_no 會隨反向檢查遞減，方便使用者確認畫面確實回到舊影格。
+        """
+        shown = frame.copy()
+        if predicted_roi is not None:
+            x, y, w, h = map(int, self._clip(frame, predicted_roi))
+            cv2.rectangle(shown, (x, y), (x+w, y+h), (0, 165, 255), 2)
+            cv2.putText(shown, "PREDICTED ROI", (x, max(18, y-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 165, 255), 2, cv2.LINE_AA)
+        if measured_roi is not None:
+            x, y, w, h = map(int, self._clip(frame, measured_roi))
+            cv2.rectangle(shown, (x, y), (x+w, y+h), (0, 220, 0), 2)
+            cv2.putText(shown, "OCR MATCH", (x, min(shown.shape[0]-6, y+h+18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 0), 2, cv2.LINE_AA)
+        cv2.rectangle(shown, (0, 0), (shown.shape[1], 42), (20, 20, 20), -1)
+        cv2.putText(shown, f"REVERSE CHECK | F{frame_no} | ID {track_id} | {note}",
+                    (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+        self.monitor_frame_signal.emit(shown, int(frame_no), "REVERSE CHECK")
+        self._report('reverse_check_frame',
+            f'反向檢查顯示影格 F{frame_no}｜ID {track_id}｜{note}',
+            frame_no, track_id=track_id, predicted_roi=predicted_roi,
+            measured_roi=measured_roi, reverse_check=True)
+
     def _retroactively_verify_gaps(self, cap, history, start_frame, end_frame,
                                    frame_w, frame_h, reader):
         """回溯檢查由 None 標記的缺失影格。
@@ -454,6 +481,8 @@ class OCRTrackingThread(QThread):
                         continue
                     pred = self._clip(frame, predicted)
                     search_roi = self._expand_roi(frame, pred, self.RETRO_ROI_EXPAND)
+                    self._draw_reverse_check(frame, frame_no, track_id, pred, None,
+                                             f"缺口 OCR 驗證 {checked+1}")
                     detections, _ = self._ocr(reader, frame, frame_no,
                                               roi=search_roi, full_frame=False, robust=True)
                     checked += 1
@@ -466,6 +495,8 @@ class OCRTrackingThread(QThread):
                             self._center(d[0])[1] - self._center(pred)[1]))
                         track_history[frame_no] = tuple(map(int, self._clip(frame, candidates[0][0])))
                         matched += 1
+                        self._draw_reverse_check(frame, frame_no, track_id, pred,
+                                                 track_history[frame_no], "OCR 確認成功")
                         self._report('retroactive_match',
                             f'回溯補到目標：F{frame_no}，ID {track_id}', frame_no,
                             track_id=track_id, roi=track_history[frame_no],
@@ -547,6 +578,8 @@ class OCRTrackingThread(QThread):
                 # 若光流失敗，仍嘗試在原位置附近搜尋；只以 OCR 確認結果填入 history。
                 search_roi = self._expand_roi(prev_frame, predicted,
                     self.RETRO_ROI_EXPAND * (1.0 if motion_ok else 1.35))
+                self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
+                    f"首次偵測前搜尋 {checked+1}；光流={'OK' if motion_ok else 'fallback'}")
                 detections, _ = self._ocr(reader, prev_frame, frame_no,
                     roi=search_roi, full_frame=False, robust=True)
                 checked += 1
@@ -559,6 +592,8 @@ class OCRTrackingThread(QThread):
                     track_history[frame_no] = measured
                     matched += 1
                     current_roi = measured
+                    self._draw_reverse_check(prev_frame, frame_no, track_id, predicted,
+                                             measured, "首次偵測前 OCR 確認成功")
                     self._report('retroactive_first_match',
                         f'首次偵測回溯補到目標：F{frame_no}，ID {track_id}', frame_no,
                         track_id=track_id, roi=measured, retro_checked=checked,
@@ -952,7 +987,12 @@ class OCRTrackingThread(QThread):
                     for j, det in enumerate(detections):
                         if j in used_dets:
                             continue
-                        if any(self._iou(det[0], tr['roi']) > .80 for tr in tracks.values()):
+                        # Only suppress a near-identical duplicate if another track was OCR-updated
+                        # on THIS frame. A stale/predicted neighbouring track must not block a
+                        # new instance of the same text in a row of identical targets.
+                        if any(self._iou(det[0], tr['roi']) > .90 and
+                               int(tr.get('last_ocr_frame', -10**9)) == frame_no
+                               for tr in tracks.values()):
                             continue
                         if self.target_text.strip() and self._normalize(self.target_text) not in self._normalize(det[1]):
                             continue
@@ -980,8 +1020,12 @@ class OCRTrackingThread(QThread):
                         mask_roi = self._clip(frame, (cx-pw*scale/2, cy-ph*scale/2,
                                                       pw*scale, ph*scale))
                     history.setdefault(tid, {})[frame_no] = mask_roi
-                    if mask_roi is not None and not any(self._iou(mask_roi, old) > .88 for old in frame_rois):
-                        frame_rois.append(tuple(map(int, mask_roi)))
+                    # Preserve separate masks for adjacent identical targets. Exact duplicate
+                    # boxes are already controlled by one-to-one OCR assignment; overlapping
+                    # masks are safer than silently dropping a neighbouring target.
+                    if mask_roi is not None:
+                        if not any(self._iou(mask_roi, old) > .985 for old in frame_rois):
+                            frame_rois.append(tuple(map(int, mask_roi)))
                 data[frame_no] = frame_rois
                 if frame_no % self.MONITOR_INTERVAL == 0 or ran_ocr or need_local_recovery:
                     self._draw_monitor(frame, frame_no, monitor_tracks, 'RECOVERY MODE' if need_local_recovery else 'TRACK MODE')
@@ -1020,7 +1064,7 @@ class OCRTrackingThread(QThread):
                 rois = list(data.get(f, []))
                 for th in history.values():
                     roi = th.get(f)
-                    if roi is not None and not any(self._iou(roi, old) > .88 for old in rois):
+                    if roi is not None and not any(self._iou(roi, old) > .985 for old in rois):
                         rois.append(tuple(map(int, roi)))
                 data[f] = rois
             success = any(bool(v) for v in data.values())
