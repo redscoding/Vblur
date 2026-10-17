@@ -1,59 +1,29 @@
-
 import sys
 import os
 import time
 
-# ==================================================
-# 1. 先載入 OCR / ONNX Runtime
-#    必須放在 PyQt5 前面
-# ==================================================
+# IMPORTANT (Windows): load ONNX Runtime / RapidOCR before PyQt5.
+# This order avoids the native-DLL access violation observed when Qt is imported first.
 import onnxruntime
 from rapidocr_onnxruntime import RapidOCR
 
-# ==================================================
-# 2. 再載入 OpenCV
-# ==================================================
+# Load OpenCV after the OCR runtime, then configure Qt plugin paths before importing Qt widgets.
 import cv2
-
-# ==================================================
-# 3. 設定 PyQt5 的 Qt 外掛路徑
-#    設定好環境變數後再匯入 Qt Widgets
-# ==================================================
 import PyQt5
 
-plugin_path = os.path.join(
-    os.path.dirname(PyQt5.__file__),
-    "Qt5",
-    "plugins"
-)
-
+plugin_path = os.path.join(os.path.dirname(PyQt5.__file__), "Qt5", "plugins")
 os.environ["QT_PLUGIN_PATH"] = plugin_path
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
-    plugin_path,
-    "platforms"
-)
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugin_path, "platforms")
 
-# ==================================================
-# 4. 最後載入自己的影片處理模組與 PyQt5
-# ==================================================
 from video_processor import OCRTrackingThread, VideoProcessorThread
-
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSlider, QFileDialog, QMessageBox,
-    QGroupBox, QSpinBox, QFrame,
-    QListWidget, QAbstractItemView, QLineEdit,
-    QProgressDialog, QDialog, QProgressBar,
-    QSplitter
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QSlider, QFileDialog, QMessageBox, QGroupBox, QSpinBox, QFrame,
+    QListWidget, QAbstractItemView, QLineEdit, QProgressDialog, QDialog,
+    QProgressBar, QSplitter
 )
-
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-
-from PyQt5.QtGui import (
-    QImage, QPixmap, QPainter, QColor, QPen
-)
-
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
 
 
 MODERN_THEME = """
