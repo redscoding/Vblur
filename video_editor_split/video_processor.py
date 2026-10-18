@@ -8,6 +8,7 @@ import time
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
+from frame_buffer import FrameRingBuffer
 
 
 try:
@@ -106,13 +107,13 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 15          # Run full-frame OCR every 15 frames (about 0.5 s at 30 FPS).
+    GLOBAL_OCR_INTERVAL = 15          # ��函�恍�� OCR 瘥� 15 撟�銝�甈∴��30 FPS 蝝� 0.5 蝘�嚗�
     LOCAL_RECOVERY_INTERVAL = 3       # 追蹤遺失時約每 3 幀重試一次局部 OCR，不採用長時間指數退避
-    MAX_OCR_ROI_DIM = 800             # Maximum dimension for resized local OCR input.
-    MAX_GLOBAL_OCR_DIM = 1280         # Maximum dimension for resized full-frame OCR input.
+    MAX_OCR_ROI_DIM = 800             # 撅���� OCR 靽����頛�憭�撠�摮�蝝啁��
+    MAX_GLOBAL_OCR_DIM = 1280         # 皜�撠�撠�摮���典�函�恍�Ｙ葬��暹�����蝝啁�����憭�
     MIN_FEATURE_POINTS = 4
-    MAX_LOST_FRAMES = 3               # Number of lost frames before recovery is triggered.
-    CONSERVATIVE_MASK_FRAMES = 10     # Keep a conservative predicted mask briefly after tracking is lost.
+    MAX_LOST_FRAMES = 3  # ��� 3 撟�隞�憭梯蕭撠勗��甇Ｚ撓��箄府頠�頝∠��擐祈魚���獢�
+    CONSERVATIVE_MASK_FRAMES = 10  # ��剜�怠仃餈賣��雿輻�冽�游之��� Kalman ���皜祆��嚗����雿�瞍���桃蔗憸券��
     RECOVERY_SCALE = 3.0
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
@@ -122,10 +123,12 @@ class OCRTrackingThread(QThread):
     MAX_PATH_INTERPOLATION_GAP = 45  # 兩個可靠位置之間最多以路徑補遮 45 幀（30 FPS 約 1.5 秒）
     PATH_MASK_EXPAND = 1.20  # 路徑推估 ROI 稍微擴大，降低位置估計誤差造成的漏遮
     IMMEDIATE_RETRACE_ON_REACQUISITION = True  # 重新找到目標時，立即回頭檢查剛才的缺口
-    RETRO_OCR_MAX_GAP = 120           # Maximum backward OCR search span; 120 frames is 4 s at 30 FPS.
-    RETRO_ROI_EXPAND = 2.2            # Expand the predicted ROI for backward OCR search.
+    RETRO_OCR_MAX_GAP = 120  # ���憭������� 60 撟����蝻箏��嚗�蝝� 2 蝘�@30FPS嚗���臭�������質矽���
+    RETRO_ROI_EXPAND = 2.2  # �����交��隞交����潭����箔葉敹���游之撅���冽��撠�������
     USE_MSER_PREFILTER = False  # Avoid MSER false negatives blocking OCR.
     ENABLE_END_REVERSE_CHECK = False  # Disable post-run reverse OCR; keep forward tracking and local recovery.
+    FRAME_CACHE_MAX_FRAMES = 12
+    FRAME_CACHE_MAX_BYTES = 96 * 1024 * 1024  # Hard cap: 96 MiB of cached source frames.
 
     def __init__(self, video_path, start_frame, total_frames, target_text, initial_roi=None):
         super().__init__()
@@ -134,12 +137,27 @@ class OCRTrackingThread(QThread):
         self.total_frames = max(0, int(total_frames))
         self.target_text = str(target_text or '')
         self.initial_roi = tuple(initial_roi) if initial_roi is not None else None
+        self.frame_buffer = None  # Created in run() after video metadata is available.
         self.was_cancelled = False
         self.cancel_frame = self.start_frame
         # Per-frame visual diagnostics consumed by the live monitor overlay.
         self._monitor_overlay = {'frame': -1, 'search_roi': None, 'candidates': [],
                                  'ocr_mode': '', 'ocr_elapsed': 0.0, 'target_count': 0,
                                  'recovery_note': ''}
+
+    def _read_frame_at(self, cap, frame_no):
+        """Read a frame from the bounded recent-frame cache or seek/read the source video.
+
+        Cache misses do not populate the cache: old backfill reads therefore cannot evict
+        the most recent forward frames from the Ring Buffer. The decoder position is restored.
+        """
+        if self.frame_buffer is not None:
+            return self.frame_buffer.get_frame(int(frame_no), cap)
+        resume = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
+        ok, frame = cap.read()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, resume)
+        return (frame.copy() if ok and frame is not None else None)
 
     def _report(self, stage, message, frame_no=None, **extra):
         self.monitor_data_signal.emit({'stage': stage, 'message': message,
@@ -487,10 +505,10 @@ class OCRTrackingThread(QThread):
 
     def _draw_reverse_check(self, frame, frame_no, track_id, predicted_roi=None,
                             measured_roi=None, note="回溯檢查"):
-        """Draw the reverse-search frame and its predicted/measured ROIs in the monitor.
+        """��� GUI ��單�������折＊蝷箏�����瑼Ｘ�亙祕���霈�������敶望�潦��
 
-        Orange indicates the predicted ROI; green indicates an OCR-confirmed ROI.
-        The frame number shown is the source-video frame index.
+        璈�獢�=������餈質馱���皜祆��撠�雿�蝵殷��蝬�獢�=OCR 蝣箄��雿�蝵柴��
+        frame_no �����典�����瑼Ｘ�仿��皜�嚗���嫣噶雿輻�刻��蝣箄����恍�ＹⅡ撖血����啗��敶望�潦��
         """
         shown = frame.copy()
         if predicted_roi is not None:
@@ -538,9 +556,8 @@ class OCRTrackingThread(QThread):
                             left_roi, right_roi, resume_frame=None):
         """Show a sampled path-interpolated ROI in the live monitor window."""
         try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
-            ok, frame = cap.read()
-            if not ok or frame is None:
+            frame = self._read_frame_at(cap, frame_no)
+            if frame is None:
                 return
             shown = frame.copy()
             x, y, w, h = self._clip(shown, roi)
@@ -568,10 +585,11 @@ class OCRTrackingThread(QThread):
 
     def _retroactively_verify_gaps(self, cap, history, start_frame, end_frame,
                                    frame_w, frame_h, reader):
-        """Re-check gaps in a track history using local OCR and full-frame fallback.
+        """���皞舀炎��亦�� None 璅�閮����蝻箏仃敶望�潦��
 
-        OCR-confirmed boxes are written into the supplied history. Missing detections
-        remain missing here; path interpolation is handled by a separate function.
+        ��芸�典��銝�餈質馱頠�頝∠�����敺���賣��������獢����嚗����隞亙�拍垢雿�蝵桐摯蝞�撅���� OCR ROI���
+        蝻箏��銝������� RETRO_OCR_MAX_GAP ��批�塚�����皞舀��������隞� OCR 撖阡��獢�閬�撖怨府敶望�潦��
+        ��������賢��銝����撠�瘥�銝�撟���賢�瑁�� OCR嚗���芾����� history 銝剜��蝣箸����� None ���蝻箏�����
         """
         checked = 0
         matched = 0
@@ -603,9 +621,8 @@ class OCRTrackingThread(QThread):
                 for frame_no in missing:
                     ratio = (frame_no - left) / float(right - left)
                     predicted = tuple(int(round(a[i] * (1-ratio) + b[i] * ratio)) for i in range(4))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
+                    frame = self._read_frame_at(cap, frame_no)
+                    if frame is None:
                         continue
                     pred = self._clip(frame, predicted)
                     search_roi = self._expand_roi(frame, pred, self.RETRO_ROI_EXPAND)
@@ -651,11 +668,12 @@ class OCRTrackingThread(QThread):
 
     def _retroactively_search_before_first_detection(self, cap, history, start_frame,
                                                      end_frame, frame_w, frame_h, reader):
-        """Search backward from a newly detected target toward the tracking start frame.
+        """撠�瘥�璇�頠�頝∠�����蝚砌��甈∪歇��乩��蝵柴��銋�������������餈質馱 + 撅���� OCR���
 
-        Each previous frame is checked near the motion-predicted position. When OCR
-        confirms the target, its measured box is stored; otherwise a conservative
-        predicted box is stored so the exporter can mask that frame as well.
+        �����航�������箏����餌����函�恍�� OCR 瞍�������憪���箇�曉蔣��潛��蝚砌�����畾萸��
+        ��望����拍����舫��獢����������撟�餈質馱��孵噩暺�嚗����皜� ROI嚗������� OCR 蝣箄����格�����
+        ��芣�� OCR 蝣箄����格�����敶望�潭��撖怠�� history嚗���踹�����銝�蝣箏��������皜祆����嗆�����撖衣�格�����
+        瘜冽��嚗���亦�格����券��畾菜����������⊿�剖����������湧����格�������ａ����恍�ｇ��隞���⊥��靽�霅���曉�����
         """
         target = self._normalize(self.target_text)
         max_back = max(0, int(self.RETRO_OCR_MAX_GAP))
@@ -672,9 +690,8 @@ class OCRTrackingThread(QThread):
             if first_frame <= scan_start:
                 continue
             first_roi = tuple(map(int, track_history[first_frame]))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(first_frame))
-            ok, anchor_frame = cap.read()
-            if not ok or anchor_frame is None:
+            anchor_frame = self._read_frame_at(cap, first_frame)
+            if anchor_frame is None:
                 continue
             current_frame = anchor_frame
             current_roi = self._clip(current_frame, first_roi)
@@ -685,11 +702,10 @@ class OCRTrackingThread(QThread):
                 first_frame, track_id=track_id, from_frame=first_frame,
                 to_frame=scan_start, max_back=max_back)
 
-            # Walk backward one frame at a time and update the ROI estimate for each frame.
+            # ���������撟�蝘餃��嚗�瘥�甈∪����桀��獢���批����孵噩暺�嚗�������餈賢�啣��銝�撟����
             for frame_no in range(first_frame - 1, scan_start - 1, -1):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
-                ok, prev_frame = cap.read()
-                if not ok or prev_frame is None:
+                prev_frame = self._read_frame_at(cap, frame_no)
+                if prev_frame is None:
                     break
                 prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
                 x, y, w, h = self._clip(current_frame, current_roi)
@@ -715,7 +731,7 @@ class OCRTrackingThread(QThread):
                                 predicted = self._clip(prev_frame, (current_roi[0] + delta[0],
                                     current_roi[1] + delta[1], current_roi[2], current_roi[3]))
                                 motion_ok = True
-                # Search around the predicted position; save a predicted mask even when OCR misses.
+                # ��亙��瘚�憭望��嚗�隞����閰血�典��雿�蝵桅��餈����撠�嚗���芯誑 OCR 蝣箄��蝯����憛怠�� history���
                 search_roi = self._expand_roi(prev_frame, predicted,
                     self.RETRO_ROI_EXPAND * (1.0 if motion_ok else 1.35))
                 self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
@@ -816,6 +832,9 @@ class OCRTrackingThread(QThread):
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError('無法開啟影片檔案。')
+            self.frame_buffer = FrameRingBuffer(
+                max_frames=self.FRAME_CACHE_MAX_FRAMES,
+                max_bytes=self.FRAME_CACHE_MAX_BYTES)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             if not math.isfinite(source_fps) or source_fps <= 0:
@@ -829,6 +848,7 @@ class OCRTrackingThread(QThread):
             ret, first_frame = cap.read()
             if not ret:
                 raise RuntimeError('無法讀取追蹤起始影格。')
+            self.frame_buffer.put(self.start_frame, first_frame)
 
             # Strict ROI-only design: the user must draw the target box; no full-frame OCR.
             tracks = {}
@@ -871,6 +891,7 @@ class OCRTrackingThread(QThread):
                 ret, frame = cap.read()
                 if not ret:
                     break
+                self.frame_buffer.put(frame_no, frame)
                 last_frame = frame_no
                 current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 frame_h, frame_w = frame.shape[:2]
@@ -1490,73 +1511,10 @@ class OCRTrackingThread(QThread):
         finally:
             if cap is not None:
                 cap.release()
+            if self.frame_buffer is not None:
+                self.frame_buffer.clear()
+                self.frame_buffer = None
             self.finished_signal.emit(data, last_frame, success)
 
-
-class VideoProcessorThread(QThread):
-    progress_signal = pyqtSignal(int, int)
-    finished_signal = pyqtSignal(str)
-
-    def __init__(self, video_path, output_path, mosaic_tasks, end_frame=None):
-        super().__init__()
-        self.video_path, self.output_path, self.mosaic_tasks = video_path, output_path, mosaic_tasks
-        self.end_frame = None if end_frame is None else max(0, int(end_frame))
-
-    @staticmethod
-    def _apply_mosaic(frame, roi, strength):
-        height, width = frame.shape[:2]
-        x, y, w, h = [int(round(float(v))) for v in roi]
-        x = max(0, min(x, width - 1)); y = max(0, min(y, height - 1))
-        w = max(0, min(w, width - x)); h = max(0, min(h, height - y))
-        if w <= 0 or h <= 0:
-            return
-        area = frame[y:y+h, x:x+w]
-        strength = max(1, int(strength))
-        sw, sh = max(1, w // strength), max(1, h // strength)
-        frame[y:y+h, x:x+w] = cv2.resize(cv2.resize(area, (sw, sh), interpolation=cv2.INTER_LINEAR),
-                                           (w, h), interpolation=cv2.INTER_NEAREST)
-
-    @staticmethod
-    def _rois_for_frame(task, frame_no):
-        if task.get("type") != "tracking":
-            roi = task.get("roi")
-            return [roi] if roi else []
-        value = task.get("tracking_data", {}).get(frame_no)
-        if value is None:
-            return []
-        if isinstance(value, (tuple, list)) and len(value) == 4 and all(isinstance(v, (int, float)) for v in value):
-            return [value]
-        return list(value) if isinstance(value, (list, tuple)) else []
-
-    def run(self):
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            self.finished_signal.emit(""); return
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        source_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        limit_frame = source_total - 1 if self.end_frame is None else min(source_total - 1, self.end_frame)
-        total = max(0, limit_frame + 1)
-        out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        if not out.isOpened():
-            cap.release(); self.finished_signal.emit(""); return
-        current = 0
-        try:
-            while current <= limit_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                for task in self.mosaic_tasks:
-                    if int(task.get("start", 0)) <= current <= int(task.get("end", total - 1)):
-                        for roi in self._rois_for_frame(task, current):
-                            self._apply_mosaic(frame, roi, task.get("strength", 15))
-                out.write(frame)
-                current += 1
-                if current % 15 == 0:
-                    self.progress_signal.emit(current, total)
-            self.progress_signal.emit(current, total)
-        except Exception:
-            self.finished_signal.emit(""); return
-        finally:
-            cap.release(); out.release()
-        self.finished_signal.emit(self.output_path)
+# Backwards-compatible import used by main.py.
+from export_worker import VideoProcessorThread
