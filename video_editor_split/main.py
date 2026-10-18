@@ -215,7 +215,7 @@ class OCRMonitorDialog(QDialog):
         image_layout = QVBoxLayout(image_panel)
         image_layout.setContentsMargins(0, 0, 0, 0)
         self.image_display = VideoDisplayWidget()
-        self.lbl_legend = QLabel("綠色：OCR 確認｜青色：逐幀追蹤且可遮罩｜黃色：追蹤遺失（不遮罩舊位置）｜紅色：位置跳躍被拒絕")
+        self.lbl_legend = QLabel("綠框：符合目標的 OCR｜紅框：OCR 找到但不符合目標｜橘框：OCR 實際搜尋區域／預測位置｜青框：追蹤框｜監控標頭會顯示 OCR 模式、候選數、匹配數與耗時")
         self.lbl_legend.setWordWrap(True)
         self.lbl_legend.setStyleSheet("padding: 6px; background: #202938; color: #e5e7eb; border-radius: 5px;")
         image_layout.addWidget(self.image_display, 1)
@@ -640,8 +640,11 @@ class ProVideoEditor(QMainWindow):
         self.ocr_thread.monitor_data_signal.connect(self.monitor_dialog.update_data)
         self.ocr_thread.finished_signal.connect(self.on_ocr_finished)
         self.btn_ocr.setEnabled(False)
-        self.ocr_thread.start()
         self.progress_dialog.show()
+        self.ocr_thread.start()
+        self.monitor_dialog.show()
+        self.monitor_dialog.raise_()
+        self.monitor_dialog.activateWindow()
 
     def update_ocr_progress(self, val, msg):
         if self.progress_dialog:

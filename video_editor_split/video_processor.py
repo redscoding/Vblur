@@ -106,21 +106,26 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 15          # 全畫面 OCR 每 15 幀一次（30 FPS 約 0.5 秒）
-    LOCAL_RECOVERY_INTERVAL = 12      # local ROI retry (~0.4 s at 30 FPS), with backoff
-    MAX_OCR_ROI_DIM = 800             # 局部 OCR 保留較多小字細節
-    MAX_GLOBAL_OCR_DIM = 1280         # 減少小字在全畫面縮放時的細節損失
+    GLOBAL_OCR_INTERVAL = 15          # Run full-frame OCR every 15 frames (about 0.5 s at 30 FPS).
+    LOCAL_RECOVERY_INTERVAL = 3       # 追蹤遺失時約每 3 幀重試一次局部 OCR，不採用長時間指數退避
+    MAX_OCR_ROI_DIM = 800             # Maximum dimension for resized local OCR input.
+    MAX_GLOBAL_OCR_DIM = 1280         # Maximum dimension for resized full-frame OCR input.
     MIN_FEATURE_POINTS = 4
-    MAX_LOST_FRAMES = 3  # 達 3 幀仍失追就停止輸出該軌跡的馬賽克框
-    CONSERVATIVE_MASK_FRAMES = 5  # 短暫失追時使用擴大的 Kalman 預測框，降低漏遮罩風險
+    MAX_LOST_FRAMES = 3               # Number of lost frames before recovery is triggered.
+    CONSERVATIVE_MASK_FRAMES = 10     # Keep a conservative predicted mask briefly after tracking is lost.
     RECOVERY_SCALE = 3.0
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
-    MONITOR_INTERVAL = 2
-    INTERPOLATE_MAX_GAP = 2
-    RETRO_OCR_MAX_GAP = 60  # 最多回查 60 幀的缺口；約 2 秒@30FPS，可依效能調整
-    RETRO_ROI_EXPAND = 2.2  # 回查時以插值框為中心擴大局部搜尋區域
+    MONITOR_INTERVAL = 2  # Update the live preview about 15 times/second at 30 FPS.
+    RETROACTIVE_SEGMENT_INTERVAL = 90  # 每 90 幀進行一次分段回溯
+    INTERPOLATE_MAX_GAP = 2  # 保留舊的短缺口設定，路徑補遮另有獨立上限
+    MAX_PATH_INTERPOLATION_GAP = 45  # 兩個可靠位置之間最多以路徑補遮 45 幀（30 FPS 約 1.5 秒）
+    PATH_MASK_EXPAND = 1.20  # 路徑推估 ROI 稍微擴大，降低位置估計誤差造成的漏遮
+    IMMEDIATE_RETRACE_ON_REACQUISITION = True  # 重新找到目標時，立即回頭檢查剛才的缺口
+    RETRO_OCR_MAX_GAP = 120           # Maximum backward OCR search span; 120 frames is 4 s at 30 FPS.
+    RETRO_ROI_EXPAND = 2.2            # Expand the predicted ROI for backward OCR search.
     USE_MSER_PREFILTER = False  # Avoid MSER false negatives blocking OCR.
+    ENABLE_END_REVERSE_CHECK = False  # Disable post-run reverse OCR; keep forward tracking and local recovery.
 
     def __init__(self, video_path, start_frame, total_frames, target_text, initial_roi=None):
         super().__init__()
@@ -129,6 +134,12 @@ class OCRTrackingThread(QThread):
         self.total_frames = max(0, int(total_frames))
         self.target_text = str(target_text or '')
         self.initial_roi = tuple(initial_roi) if initial_roi is not None else None
+        self.was_cancelled = False
+        self.cancel_frame = self.start_frame
+        # Per-frame visual diagnostics consumed by the live monitor overlay.
+        self._monitor_overlay = {'frame': -1, 'search_roi': None, 'candidates': [],
+                                 'ocr_mode': '', 'ocr_elapsed': 0.0, 'target_count': 0,
+                                 'recovery_note': ''}
 
     def _report(self, stage, message, frame_no=None, **extra):
         self.monitor_data_signal.emit({'stage': stage, 'message': message,
@@ -167,11 +178,11 @@ class OCRTrackingThread(QThread):
             return {"backend": "rapidocr-onnxruntime", "engine": RapidOCR()}
         except Exception as exc:
             raise RuntimeError(
-                "RapidOCR 無法載入。請在目前執行 main.py 的同一個虛擬環境安裝：\n"
+                "RapidOCR 初始化失敗。請確認已安裝 rapidocr-onnxruntime 與 onnxruntime。\n"
                 "python -m pip install --upgrade rapidocr-onnxruntime onnxruntime\n"
-                "若目前使用 Python 3.14，建議改用 64-bit Python 3.11/3.12 建立新 venv；"
-                "本版本不再載入 EasyOCR/PyTorch 作為備援。\n"
-                f"詳細錯誤：{type(exc).__name__}: {exc}"
+                "若目前使用 Python 3.14，建議改用 64-bit Python 3.11 或 3.12 建立虛擬環境。\n"
+                "此版本使用 RapidOCR，不需要 EasyOCR 或 PyTorch。\n"
+                f"錯誤詳情：{type(exc).__name__}: {exc}"
             ) from exc
 
     @staticmethod
@@ -279,7 +290,7 @@ class OCRTrackingThread(QThread):
 
     @staticmethod
     def _create_visual_tracker(frame, roi):
-        # 建立每個目標獨立的 CSRT tracker；不可用時退回 Kalman + 光流。
+        # 撱箇��瘥������格����函����� CSRT tracker嚗�銝���舐�冽�������� Kalman + ���瘚����
         try:
             creator = getattr(cv2, 'TrackerCSRT_create', None)
             if creator is None and hasattr(cv2, 'legacy'):
@@ -324,7 +335,7 @@ class OCRTrackingThread(QThread):
             max_dim = self.MAX_GLOBAL_OCR_DIM
         else:
             if roi is None:
-                self._report('ocr_skipped', '局部 OCR 缺少 ROI', frame_no)
+                self._report('ocr_skipped', '未提供 OCR 搜尋區域，略過本次 OCR', frame_no)
                 return [], 0.0
             x, y, w, h = self._clip(frame, roi)
             crop = frame[y:y+h, x:x+w]
@@ -352,18 +363,14 @@ class OCRTrackingThread(QThread):
             try:
                 results = self._run_ocr_engine(reader, variant_image)
             except Exception as exc:
-                self._report('error', f'OCR {variant_name} 失敗：{type(exc).__name__}: {exc}', frame_no)
+                self._report('error', f'OCR 前處理 {variant_name} 失敗：{type(exc).__name__}: {exc}', frame_no)
                 results = []
             for pts, text, conf in results:
                 normalized = self._normalize(text)
-                raw.append({'text': text, 'confidence': conf, 'variant': variant_name})
-                # If no target text is supplied, don't let OCR create new identities.
-                if conf < self.MIN_OCR_CONFIDENCE or not target or target not in normalized:
-                    continue
                 pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
                 x1, y1 = np.floor(pts.min(axis=0)).astype(int)
                 x2, y2 = np.ceil(pts.max(axis=0)).astype(int)
-                # Map OCR coordinates from resized ROI back to original frame coordinates.
+                # Convert OCR coordinates from resized crop to original frame coordinates.
                 x1, x2 = int(x1 / scale), int(x2 / scale)
                 y1, y2 = int(y1 / scale), int(y2 / scale)
                 bw, bh = x2-x1, y2-y1
@@ -371,7 +378,13 @@ class OCRTrackingThread(QThread):
                     continue
                 px, py = max(2, int(bw*.12)), max(2, int(bh*.20))
                 box = self._clip(frame, (x+x1-px, y+y1-py, bw+2*px, bh+2*py))
-                found.append((box, text, conf))
+                matched = bool(conf >= self.MIN_OCR_CONFIDENCE and target and target in normalized)
+                raw.append({'text': text, 'confidence': float(conf), 'variant': variant_name,
+                            'bbox': tuple(map(int, box)), 'matched': matched})
+                # Draw every OCR candidate in the monitor, including non-matching text.
+                # Only target matches may create or update tracked identities.
+                if matched:
+                    found.append((box, text, conf))
             if found:
                 break  # only pay for preprocessing variants if the original failed
 
@@ -382,9 +395,15 @@ class OCRTrackingThread(QThread):
                 unique.append(item)
         elapsed = time.monotonic() - started
         mode = 'GLOBAL_KEYFRAME' if full_frame else 'LOCAL_ROI'
-        self._report('ocr_done', f'OCR {mode} 完成：{elapsed:.2f}s，目標 {len(unique)} 個',
-                     frame_no, elapsed_seconds=elapsed, target_count=len(unique), ocr_results=raw[:20],
-                     roi=(x, y, w, h), mode=mode)
+        self._monitor_overlay = {
+            'frame': int(frame_no), 'search_roi': (x, y, w, h),
+            'candidates': raw[:30], 'ocr_mode': mode,
+            'ocr_elapsed': float(elapsed), 'target_count': len(unique),
+        }
+        self._report('ocr_done', f'OCR {mode} 完成：耗時 {elapsed:.2f} 秒，找到 {len(unique)} 個符合目標的候選框；原始文字框 {len(raw)} 個',
+                     frame_no, elapsed_seconds=elapsed, target_count=len(unique), result_count=len(raw),
+                     ocr_results=raw[:20], roi=(x, y, w, h), mode=mode,
+                     target_text=self.target_text)
         return unique, elapsed
 
     def _draw_monitor(self, frame, frame_no, tracks, mode):
@@ -395,27 +414,83 @@ class OCRTrackingThread(QThread):
         for tid, track in tracks.items():
             # Hide stale visualization after three consecutive lost frames; keep the
             # internal track state so local OCR may still recover it later.
-            if int(track.get('lost', 0)) > self.MAX_LOST_FRAMES:
+            if int(track.get('lost', 0)) > self.CONSERVATIVE_MASK_FRAMES:
                 continue
             roi = track.get('roi', (0, 0, 1, 1))
             x, y, w, h = roi
             state = track.get('state', 'TRACKING')
             color = colors.get(state, (255, 255, 255))
             cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
+            # Dashed-style predicted box shows where motion model expects the target.
+            predicted_roi = track.get('predicted_roi')
+            if predicted_roi is not None and (track.get('lost', 0) > 0 or state in ('RECOVERY', 'LOST')):
+                px, py, pw, ph = map(int, self._clip(frame, predicted_roi))
+                for xx in range(px, px+pw, 14):
+                    cv2.line(shown, (xx, py), (min(xx+7, px+pw), py), (0, 165, 255), 2)
+                    cv2.line(shown, (xx, py+ph), (min(xx+7, px+pw), py+ph), (0, 165, 255), 2)
+                for yy in range(py, py+ph, 14):
+                    cv2.line(shown, (px, yy), (px, min(yy+7, py+ph)), (0, 165, 255), 2)
+                    cv2.line(shown, (px+pw, yy), (px+pw, min(yy+7, py+ph)), (0, 165, 255), 2)
             reason = track.get('loss_reason', '')
+            recovery_note = str(track.get('recovery_note', ''))
             label = f'ID {tid} {state} v={track.get("speed", 0):.1f}' + (f' [{reason}]' if reason else '')
+            if recovery_note and int(track.get('lost', 0)) > 0:
+                label += ' | ' + recovery_note[:32]
             cv2.putText(shown, label, (x, max(18, y-5)), cv2.FONT_HERSHEY_SIMPLEX,
                         .48, color, 2, cv2.LINE_AA)
-        cv2.putText(shown, f'Frame {frame_no} | {mode} | tracks={len(tracks)}', (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2, cv2.LINE_AA)
+        overlay = getattr(self, '_monitor_overlay', {})
+        # Visualize OCR search ROI only on the exact frame where OCR ran, avoiding stale boxes.
+        if overlay.get('frame') == int(frame_no):
+            search_roi = overlay.get('search_roi')
+            if search_roi is not None:
+                sx, sy, sw, sh = map(int, self._clip(frame, search_roi))
+                # Orange = area sent into OCR (whole frame for global OCR keyframes).
+                cv2.rectangle(shown, (sx, sy), (sx+sw, sy+sh), (0, 165, 255), 2)
+                cv2.putText(shown, f"OCR SEARCH: {overlay.get('ocr_mode', '')}",
+                            (sx, min(shown.shape[0]-8, sy+20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .48, (0, 165, 255), 2, cv2.LINE_AA)
+            for cand in overlay.get('candidates', []):
+                bbox = cand.get('bbox')
+                if not bbox:
+                    continue
+                cx, cy, cw, ch = map(int, self._clip(frame, bbox))
+                matched = bool(cand.get('matched'))
+                conf = float(cand.get('confidence', 0.0) or 0.0)
+                # Green = text matches target; red = OCR text found but not a target match.
+                color = (0, 220, 0) if matched else (40, 40, 230)
+                cv2.rectangle(shown, (cx, cy), (cx+cw, cy+ch), color, 2 if matched else 1)
+                text = str(cand.get('text', '')).replace('\n', ' ')[:24]
+                label = f"{'MATCH' if matched else 'OCR'} {conf:.2f}: {text}"
+                label_y = cy-5 if cy > 24 else min(shown.shape[0]-6, cy+ch+18)
+                cv2.putText(shown, label, (cx, label_y), cv2.FONT_HERSHEY_SIMPLEX,
+                            .42, color, 1, cv2.LINE_AA)
+            info = (f"OCR={overlay.get('ocr_mode', '--')}  candidates={len(overlay.get('candidates', []))}  "
+                    f"matches={overlay.get('target_count', 0)}  {overlay.get('ocr_elapsed', 0.0):.2f}s")
+            cv2.rectangle(shown, (0, 0), (shown.shape[1], 48), (18, 18, 18), -1)
+            cv2.putText(shown, info, (12, 19), cv2.FONT_HERSHEY_SIMPLEX,
+                        .48, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(shown, f'Frame {frame_no} | {mode} | tracks={len(tracks)}', (12, 41),
+                        cv2.FONT_HERSHEY_SIMPLEX, .48, (255,255,255), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(shown, f'Frame {frame_no} | {mode} | tracks={len(tracks)}', (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2, cv2.LINE_AA)
+        # Fixed legend makes it easier to distinguish real OCR results from predictions.
+        legend_y = max(18, shown.shape[0] - 12)
+        cv2.rectangle(shown, (0, max(0, legend_y - 22)), (shown.shape[1], shown.shape[0]), (18, 18, 18), -1)
+        cv2.putText(shown, 'GREEN=OCR MATCH  RED=OTHER OCR  ORANGE=SEARCH/PREDICTION  BLUE=TRACK',
+                    (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, .43, (245, 245, 245), 1, cv2.LINE_AA)
+        mh, mw = shown.shape[:2]
+        monitor_scale = min(1.0, 960.0 / max(mh, mw))
+        if monitor_scale < 1.0:
+            shown = cv2.resize(shown, (max(1, int(mw * monitor_scale)), max(1, int(mh * monitor_scale))), interpolation=cv2.INTER_AREA)
         self.monitor_frame_signal.emit(shown, int(frame_no), mode)
 
     def _draw_reverse_check(self, frame, frame_no, track_id, predicted_roi=None,
-                            measured_roi=None, note="反向檢查中"):
-        """在 GUI 即時監控顯示反向檢查實際讀取的影格。
+                            measured_roi=None, note="回溯檢查"):
+        """Draw the reverse-search frame and its predicted/measured ROIs in the monitor.
 
-        橘框=反向追蹤預測搜尋位置；綠框=OCR 確認位置。
-        frame_no 會隨反向檢查遞減，方便使用者確認畫面確實回到舊影格。
+        Orange indicates the predicted ROI; green indicates an OCR-confirmed ROI.
+        The frame number shown is the source-video frame index.
         """
         shown = frame.copy()
         if predicted_roi is not None:
@@ -428,28 +503,81 @@ class OCRTrackingThread(QThread):
             cv2.rectangle(shown, (x, y), (x+w, y+h), (0, 220, 0), 2)
             cv2.putText(shown, "OCR MATCH", (x, min(shown.shape[0]-6, y+h+18)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 0), 2, cv2.LINE_AA)
+        overlay = getattr(self, '_monitor_overlay', {})
+        if overlay.get('frame') == int(frame_no):
+            sx_roi = overlay.get('search_roi')
+            if sx_roi is not None:
+                sx, sy, sw, sh = map(int, self._clip(frame, sx_roi))
+                cv2.rectangle(shown, (sx, sy), (sx+sw, sy+sh), (255, 180, 0), 2)
+                cv2.putText(shown, 'LOCAL OCR SEARCH', (sx, min(shown.shape[0]-8, sy+18)),
+                            cv2.FONT_HERSHEY_SIMPLEX, .45, (255, 180, 0), 1, cv2.LINE_AA)
+            for cand in overlay.get('candidates', []):
+                bbox = cand.get('bbox')
+                if not bbox:
+                    continue
+                cx, cy, cw, ch = map(int, self._clip(frame, bbox))
+                is_match = bool(cand.get('matched'))
+                col = (0, 220, 0) if is_match else (40, 40, 230)
+                cv2.rectangle(shown, (cx, cy), (cx+cw, cy+ch), col, 2 if is_match else 1)
+                cv2.putText(shown, f"{'MATCH' if is_match else 'OCR'} {float(cand.get('confidence', 0)):.2f}",
+                            (cx, max(16, cy-4)), cv2.FONT_HERSHEY_SIMPLEX, .42, col, 1, cv2.LINE_AA)
         cv2.rectangle(shown, (0, 0), (shown.shape[1], 42), (20, 20, 20), -1)
         cv2.putText(shown, f"REVERSE CHECK | F{frame_no} | ID {track_id} | {note}",
                     (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-        self.monitor_frame_signal.emit(shown, int(frame_no), "REVERSE CHECK")
+        mh, mw = shown.shape[:2]
+        monitor_scale = min(1.0, 960.0 / max(mh, mw))
+        if monitor_scale < 1.0:
+            shown = cv2.resize(shown, (max(1, int(mw * monitor_scale)), max(1, int(mh * monitor_scale))), interpolation=cv2.INTER_AREA)
+        self.monitor_frame_signal.emit(shown, int(frame_no), "分段回溯 OCR")
         self._report('reverse_check_frame',
-            f'反向檢查顯示影格 F{frame_no}｜ID {track_id}｜{note}',
+            f'回溯檢查影格 F{frame_no}，ID {track_id}：{note}',
             frame_no, track_id=track_id, predicted_roi=predicted_roi,
             measured_roi=measured_roi, reverse_check=True)
 
+    def _draw_path_backfill(self, cap, frame_no, track_id, roi, left_frame, right_frame,
+                            left_roi, right_roi, resume_frame=None):
+        """Show a sampled path-interpolated ROI in the live monitor window."""
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return
+            shown = frame.copy()
+            x, y, w, h = self._clip(shown, roi)
+            ax, ay = self._center(left_roi)
+            bx, by = self._center(right_roi)
+            cv2.line(shown, (int(ax), int(ay)), (int(bx), int(by)), (255, 0, 220), 2, cv2.LINE_AA)
+            cv2.rectangle(shown, (x, y), (x+w, y+h), (255, 0, 220), 2)
+            cv2.putText(shown, f"PATH MASK | F{frame_no} | ID {track_id} | anchors F{left_frame}-F{right_frame}",
+                        (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            mh, mw = shown.shape[:2]
+            scale = min(1.0, 960.0 / max(mh, mw))
+            if scale < 1.0:
+                shown = cv2.resize(shown, (max(1, int(mw*scale)), max(1, int(mh*scale))),
+                                   interpolation=cv2.INTER_AREA)
+            self.monitor_frame_signal.emit(shown, int(frame_no), "路徑補遮（推估 ROI）")
+            self._report('path_mask_visualized',
+                f'路徑補遮視覺化：F{frame_no}，ID {track_id}，參考錨點 F{left_frame}/F{right_frame}',
+                frame_no, track_id=track_id, roi=roi, left_frame=left_frame,
+                right_frame=right_frame, path_mask=True)
+        except Exception:
+            pass
+        finally:
+            if resume_frame is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(resume_frame))
+
     def _retroactively_verify_gaps(self, cap, history, start_frame, end_frame,
                                    frame_w, frame_h, reader):
-        """回溯檢查由 None 標記的缺失影格。
+        """Re-check gaps in a track history using local OCR and full-frame fallback.
 
-        只在同一追蹤軌跡的前後都有有效框時，才以兩端位置估算局部 OCR ROI。
-        缺口上限由 RETRO_OCR_MAX_GAP 控制；回溯成功時以 OCR 實際框覆寫該影格。
-        這個函式不會對每一幀都執行 OCR，只處理 history 中明確標成 None 的缺口。
+        OCR-confirmed boxes are written into the supplied history. Missing detections
+        remain missing here; path interpolation is handled by a separate function.
         """
         checked = 0
         matched = 0
         max_gap = max(0, int(self.RETRO_OCR_MAX_GAP))
         if max_gap == 0:
-            self._report('retroactive_check', '回溯已停用：RETRO_OCR_MAX_GAP=0', end_frame,
+            self._report('retroactive_check', '回溯補查已停用：RETRO_OCR_MAX_GAP 設為 0', end_frame,
                          retro_checked=0, retro_matched=0, max_gap=max_gap)
             return checked
 
@@ -469,7 +597,7 @@ class OCRTrackingThread(QThread):
                 if not missing:
                     continue
                 self._report('retroactive_check',
-                    f'回溯軌跡 ID {track_id}：F{left}–F{right}，缺失 {len(missing)} 幀',
+                    f'分段回溯：ID {track_id}，F{left} 到 F{right}，檢查缺漏 {len(missing)} 幀',
                     right, track_id=track_id, gap=gap, retro_checked=checked,
                     retro_matched=matched, max_gap=max_gap)
                 for frame_no in missing:
@@ -482,21 +610,34 @@ class OCRTrackingThread(QThread):
                     pred = self._clip(frame, predicted)
                     search_roi = self._expand_roi(frame, pred, self.RETRO_ROI_EXPAND)
                     self._draw_reverse_check(frame, frame_no, track_id, pred, None,
-                                             f"缺口 OCR 驗證 {checked+1}")
+                                             f"缺漏影格 OCR 補查 #{checked+1}")
                     detections, _ = self._ocr(reader, frame, frame_no,
                                               roi=search_roi, full_frame=False, robust=True)
                     checked += 1
                     candidates = [d for d in detections
                                   if target in self._normalize(d[1])]
+                    if not candidates:
+                        self._report('retroactive_global_fallback',
+                            f'F{frame_no} 局部回溯未匹配，改做全畫面 OCR', frame_no,
+                            track_id=track_id, search_roi=search_roi)
+                        global_detections, _ = self._ocr(
+                            reader, frame, frame_no, full_frame=True, robust=True)
+                        checked += 1
+                        detections.extend(global_detections)
+                        candidates = [d for d in global_detections
+                                      if target in self._normalize(d[1])]
+                    self._draw_reverse_check(
+                        frame, frame_no, track_id, pred, None,
+                        f"補查完成：候選 {len(self._monitor_overlay.get('candidates', []))}，匹配 {len(candidates)}")
                     if candidates:
-                        # 選擇最接近前後座標插值位置的同文字候選框。
+                        # ��豢�������亥�����敺�摨扳�������潔��蝵桃��������摮������豢�����
                         candidates.sort(key=lambda d: math.hypot(
                             self._center(d[0])[0] - self._center(pred)[0],
                             self._center(d[0])[1] - self._center(pred)[1]))
                         track_history[frame_no] = tuple(map(int, self._clip(frame, candidates[0][0])))
                         matched += 1
                         self._draw_reverse_check(frame, frame_no, track_id, pred,
-                                                 track_history[frame_no], "OCR 確認成功")
+                                                 track_history[frame_no], "OCR 已確認")
                         self._report('retroactive_match',
                             f'回溯補到目標：F{frame_no}，ID {track_id}', frame_no,
                             track_id=track_id, roi=track_history[frame_no],
@@ -504,18 +645,17 @@ class OCRTrackingThread(QThread):
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(end_frame))
         self._report('retroactive_check',
-            f'回溯完成：檢查 {checked} 幀，OCR 確認並修正 {matched} 幀',
+            f'分段回溯完成：檢查 {checked} 幀，OCR 成功補到 {matched} 幀',
             end_frame, retro_checked=checked, retro_matched=matched, max_gap=max_gap)
         return checked
 
     def _retroactively_search_before_first_detection(self, cap, history, start_frame,
                                                      end_frame, frame_w, frame_h, reader):
-        """對每條軌跡的「第一次已知位置」之前做反向追蹤 + 局部 OCR。
+        """Search backward from a newly detected target toward the tracking start frame.
 
-        這是補救固定頻率全畫面 OCR 漏掉初始出現影格的第二階段。
-        由最早的可靠框向前逐幀追蹤特徵點，預測 ROI，再用 OCR 確認目標。
-        只有 OCR 確認目標的影格才寫入 history，避免把不確定的預測框當成真實目標。
-        注意：若目標在這段期間有鏡頭切換、嚴重遮擋或離開畫面，仍無法保證找回。
+        Each previous frame is checked near the motion-predicted position. When OCR
+        confirms the target, its measured box is stored; otherwise a conservative
+        predicted box is stored so the exporter can mask that frame as well.
         """
         target = self._normalize(self.target_text)
         max_back = max(0, int(self.RETRO_OCR_MAX_GAP))
@@ -541,11 +681,11 @@ class OCRTrackingThread(QThread):
             current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
             tracks_checked += 1
             self._report('retroactive_first_detection',
-                f'首次偵測回溯：ID {track_id}，從 F{first_frame} 向前搜尋至 F{scan_start}',
+                f'首次偵測前回溯：ID {track_id}，從 F{first_frame} 往前檢查至 F{scan_start}',
                 first_frame, track_id=track_id, from_frame=first_frame,
                 to_frame=scan_start, max_back=max_back)
 
-            # 向前逐幀移動；每次從目前框內取特徵點，反向追到前一幀。
+            # Walk backward one frame at a time and update the ROI estimate for each frame.
             for frame_no in range(first_frame - 1, scan_start - 1, -1):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
                 ok, prev_frame = cap.read()
@@ -575,11 +715,11 @@ class OCRTrackingThread(QThread):
                                 predicted = self._clip(prev_frame, (current_roi[0] + delta[0],
                                     current_roi[1] + delta[1], current_roi[2], current_roi[3]))
                                 motion_ok = True
-                # 若光流失敗，仍嘗試在原位置附近搜尋；只以 OCR 確認結果填入 history。
+                # Search around the predicted position; save a predicted mask even when OCR misses.
                 search_roi = self._expand_roi(prev_frame, predicted,
                     self.RETRO_ROI_EXPAND * (1.0 if motion_ok else 1.35))
                 self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
-                    f"首次偵測前搜尋 {checked+1}；光流={'OK' if motion_ok else 'fallback'}")
+                    f"首次偵測前回溯 #{checked+1}，光流={'成功' if motion_ok else '備援'}")
                 detections, _ = self._ocr(reader, prev_frame, frame_no,
                     roi=search_roi, full_frame=False, robust=True)
                 checked += 1
@@ -593,20 +733,29 @@ class OCRTrackingThread(QThread):
                     matched += 1
                     current_roi = measured
                     self._draw_reverse_check(prev_frame, frame_no, track_id, predicted,
-                                             measured, "首次偵測前 OCR 確認成功")
+                                             measured, "首次偵測前回溯：OCR 已確認")
                     self._report('retroactive_first_match',
-                        f'首次偵測回溯補到目標：F{frame_no}，ID {track_id}', frame_no,
+                        f'首次偵測前回溯找到目標：F{frame_no}，ID {track_id}', frame_no,
                         track_id=track_id, roi=measured, retro_checked=checked,
                         retro_matched=matched)
                 else:
-                    # 保留光流預測供下一幀追蹤，但不把未經 OCR 確認的框寫入馬賽克資料。
+                    # OCR 未確認時，仍將反向光流推估框寫入逐幀 history。
+                    # 否則只更新 current_roi、卻不寫 history，匯出時就完全不會遮這一幀。
+                    px, py, pw, ph = self._clip(prev_frame, predicted)
+                    ew = max(2, int(round(pw * self.PATH_MASK_EXPAND)))
+                    eh = max(2, int(round(ph * self.PATH_MASK_EXPAND)))
+                    predicted_mask = self._clip(
+                        prev_frame,
+                        (px + pw / 2.0 - ew / 2.0,
+                         py + ph / 2.0 - eh / 2.0, ew, eh))
+                    track_history[frame_no] = tuple(map(int, predicted_mask))
                     current_roi = predicted
                 current_frame = prev_frame
                 current_gray = prev_gray
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(end_frame))
         self._report('retroactive_first_detection',
-            f'首次偵測前回溯完成：檢查 {checked} 幀，OCR 確認補到 {matched} 幀，軌跡 {tracks_checked} 條',
+            f'首次偵測前回溯完成：檢查 {checked} 幀、補到 {matched} 幀、檢查 {tracks_checked} 個目標',
             end_frame, retro_checked=checked, retro_matched=matched,
             tracks_checked=tracks_checked, max_back=max_back)
         return {"checked": checked, "matched": matched, "tracks": tracks_checked}
@@ -623,13 +772,47 @@ class OCRTrackingThread(QThread):
                         ratio = (frame_no-left)/(right-left)
                         track_history[frame_no] = tuple(int(round(a[i]*(1-ratio)+b[i]*ratio)) for i in range(4))
 
+    def _interpolate_path_gaps(self, history, max_gap=None, expand=None):
+        """Fill short/medium missing spans between two known ROIs with per-frame path masks.
+
+        This is a privacy-oriented fallback, not a claim that the estimated box is the exact
+        object position. OCR backfill runs first; interpolation only fills remaining gaps.
+        """
+        max_gap = self.MAX_PATH_INTERPOLATION_GAP if max_gap is None else max(0, int(max_gap))
+        expand = self.PATH_MASK_EXPAND if expand is None else max(1.0, float(expand))
+        filled = []
+        if max_gap <= 0:
+            return filled
+        for track_id, track_history in history.items():
+            known = sorted(f for f, roi in track_history.items() if roi is not None)
+            for left, right in zip(known, known[1:]):
+                gap = right - left - 1
+                if gap <= 0 or gap > max_gap:
+                    continue
+                a, b = track_history[left], track_history[right]
+                for frame_no in range(left + 1, right):
+                    if track_history.get(frame_no) is not None:
+                        continue
+                    ratio = (frame_no - left) / float(right - left)
+                    x = a[0] * (1-ratio) + b[0] * ratio
+                    y = a[1] * (1-ratio) + b[1] * ratio
+                    w = a[2] * (1-ratio) + b[2] * ratio
+                    h = a[3] * (1-ratio) + b[3] * ratio
+                    # Keep the interpolated center, but add a small privacy margin.
+                    ew, eh = w * expand, h * expand
+                    track_history[frame_no] = (int(round(x + w/2 - ew/2)),
+                                               int(round(y + h/2 - eh/2)),
+                                               max(2, int(round(ew))), max(2, int(round(eh))))
+                    filled.append((track_id, frame_no, tuple(map(int, track_history[frame_no])), left, right))
+        return filled
+
     def run(self):
         cap = None
         data = {}
         last_frame = self.start_frame
         success = False
         try:
-            self.progress_signal.emit(self.start_frame, '載入影片與追蹤模組...')
+            self.progress_signal.emit(self.start_frame, '正在開啟影片並初始化追蹤...')
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise RuntimeError('無法開啟影片檔案。')
@@ -637,15 +820,15 @@ class OCRTrackingThread(QThread):
             source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             if not math.isfinite(source_fps) or source_fps <= 0:
                 source_fps = 0.0
-            self._report('video_info', f'影片資訊：{source_fps:.2f} FPS，{frame_count} frames',
+            self._report('video_info', f'影片資訊：{source_fps:.2f} FPS，共 {frame_count} 幀',
                          self.start_frame, fps=source_fps, frame_count=frame_count)
             end_frame = min(self.total_frames, frame_count) if self.total_frames > 0 else frame_count
             if end_frame <= self.start_frame:
-                raise RuntimeError('起始影格超出影片範圍。')
+                raise RuntimeError('影片結束影格早於追蹤起始影格。')
             cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
             ret, first_frame = cap.read()
             if not ret:
-                raise RuntimeError('無法讀取起始影格。')
+                raise RuntimeError('無法讀取追蹤起始影格。')
 
             # Strict ROI-only design: the user must draw the target box; no full-frame OCR.
             tracks = {}
@@ -653,20 +836,20 @@ class OCRTrackingThread(QThread):
             hit_frame = self.start_frame
             reader = None
             if self.target_text.strip():
-                self.progress_signal.emit(hit_frame, '正在載入 RapidOCR（僅 ONNX Runtime，不載入 PyTorch）...')
+                self.progress_signal.emit(hit_frame, '正在初始化 RapidOCR（ONNX Runtime）...')
                 reader = self._create_reader()
                 self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
             if self.initial_roi is None:
-                raise RuntimeError('此效能版禁止全畫面 OCR。請先在預覽畫面框選單一目標，再開始追蹤。')
+                raise RuntimeError('目前模式需要先在影片預覽畫面框選一個追蹤目標。')
             roi = self._clip(first_frame, self.initial_roi)
             if roi[2] < 3 or roi[3] < 3:
-                raise RuntimeError('使用者選取的 ROI 太小或超出畫面。')
+                raise RuntimeError('框選的 ROI 太小，請重新框選較完整的目標。')
             tracks[next_id] = self._new_track(first_frame, roi, next_id, hit_frame,
                                               self.target_text, 1.0)
-            self._report('locked', f'使用人工選取 ROI 初始化追蹤：{roi}', hit_frame,
+            self._report('locked', f'已鎖定手動框選的追蹤目標：ROI={roi}', hit_frame,
                          roi=roi, mode='INIT')
             if self.target_text.strip():
-                self.progress_signal.emit(hit_frame, '已框選目標；RapidOCR 會定期掃描縮小後的關鍵影格，失追時另做局部恢復...')
+                self.progress_signal.emit(hit_frame, '追蹤開始；將持續顯示即時監控，並定期回溯補查缺漏影格...')
 
             frame_h, frame_w = first_frame.shape[:2]
 
@@ -681,7 +864,9 @@ class OCRTrackingThread(QThread):
 
             for frame_no in range(hit_frame+1, end_frame):
                 if self.isInterruptionRequested():
-                    self._report('cancelled', '使用者取消追蹤', frame_no, mode='TRACK MODE')
+                    self.was_cancelled = True
+                    self.cancel_frame = last_frame
+                    self._report('cancelled', '使用者中止追蹤；保留已處理影格，並停止後續處理。', last_frame, mode='TRACK MODE', cancelled=True)
                     break
                 ret, frame = cap.read()
                 if not ret:
@@ -691,6 +876,7 @@ class OCRTrackingThread(QThread):
                 frame_h, frame_w = frame.shape[:2]
                 detections = []
                 need_local_recovery = []
+                reacquired_events = []  # (track_id, prior_lost_frames, current_frame)
                 # Per-frame flag used by monitoring/reporting below.
                 ran_ocr = False
                 # Global motion is diagnostic only, so estimate it every 3 frames rather than
@@ -718,7 +904,7 @@ class OCRTrackingThread(QThread):
                     candidate = predicted
                     flow_count = 0
                     csrt_flow_delta = None
-                    # CSRT 每個影格更新一次，避免只靠光流造成框逐漸漂移。
+                    # CSRT 瘥����敶望�潭�湔�唬��甈∴����踹����芷�����瘚�������獢����瞍豢��蝘颯��
                     visual_tracker = track.get('visual_tracker')
                     csrt_ok = False
                     csrt_candidate = predicted
@@ -751,7 +937,7 @@ class OCRTrackingThread(QThread):
                                     distance = math.hypot(dx, dy)
                                     track['speed'] = .7*float(track['speed']) + .3*distance
                                     if csrt_ok:
-                                        # 兩種視覺訊號接近時融合；差異大時以 CSRT 為主並交由外觀檢查把關。
+                                        # ��拍車閬�閬箄�������亥�����������嚗�撌桃�啣之���隞� CSRT ��箔蜓銝虫漱��勗��閫�瑼Ｘ�交��������
                                         cc, fc = self._center(csrt_candidate), self._center(flow_candidate)
                                         csrt_flow_delta = math.hypot(cc[0]-fc[0], cc[1]-fc[1])
                                         disagreement_gate = max(25.0, math.hypot(previous_roi[2], previous_roi[3]) * 0.5)
@@ -789,7 +975,7 @@ class OCRTrackingThread(QThread):
                     if flow_ok and pred_distance > prediction_gate:
                         flow_ok = False
                         track['loss_reason'] = 'prediction_gate_rejected_possible_identity_switch'
-                    # 固定錨點避免錯誤框逐幀污染外觀模板。
+                    # ��箏����券����踹����航炊獢����撟�瘙⊥��憭�閫�璅⊥�踴��
                     anchor = track.get('anchor_appearance')
                     candidate_appearance = self._appearance(frame, candidate) if flow_ok else None
                     anchor_score = self._appearance_score(anchor, candidate_appearance)
@@ -842,8 +1028,8 @@ class OCRTrackingThread(QThread):
                         reason = track.get('loss_reason') or 'tracker_measurement_failed'
                         if track['lost'] == 1 or track['lost'] % 10 == 0:
                             self._report('tracking_lost',
-                                f'ID {tid} 追蹤失敗，初步原因={reason}；位移={move:.1f}px/frame，'
-                                f'光流點={flow_count}，模糊分數={blur_score:.1f}，全畫面位移={global_motion:.1f}px/frame',
+                                f'ID {tid} 追蹤遺失：原因={reason}，移動量={move:.1f}px/frame；'
+                                f'光流點={flow_count}，模糊分數={blur_score:.1f}，全域移動={global_motion:.1f}px/frame',
                                 frame_no, target_text=self.target_text, confidence=anchor_score,
                                 bbox=candidate, lost_count=track['lost'], patience=self.MAX_LOST_FRAMES,
                                 diagnosis=reason, diagnostics=diag_info, fps=source_fps,
@@ -872,13 +1058,14 @@ class OCRTrackingThread(QThread):
                 recovery_due = []
                 for tid in need_local_recovery:
                     tr = tracks[tid]
-                    attempts = int(tr.get('recovery_attempts', 0))
-                    retry_interval = min(120, self.LOCAL_RECOVERY_INTERVAL * (2 ** min(attempts // 2, 3)))
+                    # Recovery uses a short fixed retry interval. Exponential backoff can
+                    # leave fast-moving targets unsearched for several seconds.
+                    retry_interval = max(1, int(self.LOCAL_RECOVERY_INTERVAL))
                     if frame_no - int(tr.get('last_local_search_frame', -10**9)) >= retry_interval:
                         recovery_due.append(tid)
 
                 if reader is not None:
-                    # Full-frame OCR only at sparse keyframes (default every 45 frames),
+                    # Full-frame OCR only at sparse keyframes (default every 15 frames),
                     # resized to at most 960 px. This is necessary to find a target that
                     # appears outside the selected object's local search area.
                     if should_global_ocr:
@@ -917,13 +1104,37 @@ class OCRTrackingThread(QThread):
                         for tid in recovery_due:
                             track = tracks[tid]
                             pred = track.get('predicted_roi') or track['roi']
-                            local_roi = self._expand_roi(frame, pred, self.RECOVERY_SCALE)
                             track['last_local_search_frame'] = frame_no
                             track['recovery_attempts'] = int(track.get('recovery_attempts', 0)) + 1
-                            robust_ocr = track['recovery_attempts'] % 3 == 0
+                            attempts = int(track['recovery_attempts'])
+                            # Expand local search progressively as the target may have moved
+                            # farther than the motion model predicted.
+                            scale = min(self.RECOVERY_SCALE * (1.0 + 0.45 * max(0, attempts - 1)), 8.0)
+                            local_roi = self._expand_roi(frame, pred, scale)
+                            robust_ocr = attempts >= 2
                             local, _ = self._ocr(reader, frame, frame_no, roi=local_roi, robust=robust_ocr)
                             detections.extend(local)
                             ran_ocr = True
+                            track['recovery_note'] = f'局部恢復第 {attempts} 次，搜尋倍率 {scale:.1f}x'
+                            self._report('recovery_search',
+                                f'ID {tid} 局部恢復搜尋第 {attempts} 次，搜尋倍率 {scale:.1f}x，候選 {len(local)}',
+                                frame_no, track_id=tid, attempt=attempts, search_roi=local_roi,
+                                detections=len(local), recovery_scale=scale)
+                            # If several progressively larger local searches fail, fall back
+                            # to a robust full-frame OCR pass. This catches targets that moved
+                            # outside the predicted ROI after a sudden motion/occlusion.
+                            if not local and attempts >= 3 and (attempts - 3) % 3 == 0:
+                                global_recovery, _ = self._ocr(
+                                    reader, frame, frame_no, full_frame=True, robust=True)
+                                detections.extend(global_recovery)
+                                track['recovery_note'] = f'全畫面恢復搜尋（第 {attempts} 次嘗試）'
+                                self._report('recovery_global_fallback',
+                                    f'ID {tid} 局部搜尋未找到目標，改做全畫面 OCR；候選 {len(global_recovery)}',
+                                    frame_no, track_id=tid, attempt=attempts,
+                                    detections=len(global_recovery), mode='GLOBAL_RECOVERY')
+
+                # Keep track of brand-new OCR tracks so we can immediately trace them backward.
+                created_track_ids_this_frame = []
 
                 # Hungarian matching (SORT association) between OCR boxes and predicted tracks.
                 if detections and tracks:
@@ -945,8 +1156,20 @@ class OCRTrackingThread(QThread):
                             # Do not associate a distant same-text detection solely because
                             # the text looks alike. It must be close to the motion prediction
                             # or have meaningful box overlap.
-                            if (dist <= gate and (iou >= .02 or dist <= gate * .70 or app >= .72)) or iou >= .15:
-                                cost[i,j] = .55*(1-iou) + .30*min(1.0, dist/gate) + .10*(1-app) + .05*(1-conf)
+                            lost_track = int(tr.get('lost', 0)) > 0
+                            # A reacquired exact OCR text may be far from the stale motion
+                            # prediction after a sudden move or occlusion. Permit a wider,
+                            # bounded association gate for lost tracks; Hungarian matching
+                            # still assigns each detection to at most one track.
+                            lost_gate = max(gate, min(math.hypot(frame_w, frame_h) * 0.45, 900.0))
+                            geometrically_plausible = (
+                                (dist <= gate and (iou >= .02 or dist <= gate * .70 or app >= .72))
+                                or iou >= .15
+                            )
+                            recovery_plausible = lost_track and text_match and (dist <= lost_gate or app >= .78)
+                            if geometrically_plausible or recovery_plausible:
+                                effective_gate = lost_gate if recovery_plausible else gate
+                                cost[i,j] = .55*(1-iou) + .30*min(1.0, dist/effective_gate) + .10*(1-app) + .05*(1-conf)
                                 if not text_match:
                                     cost[i,j] += .5
                     if linear_sum_assignment is not None:
@@ -966,6 +1189,9 @@ class OCRTrackingThread(QThread):
                         tid = tids[i]
                         box, text, conf = detections[j]
                         tr = tracks[tid]
+                        old_lost_count = int(tr.get('lost', 0))
+                        if old_lost_count > 0:
+                            reacquired_events.append((tid, old_lost_count, frame_no))
                         old_center, new_center = self._center(tr['roi']), self._center(box)
                         moved = math.hypot(new_center[0]-old_center[0], new_center[1]-old_center[1])
                         corrected_box = self._clip(frame, box)
@@ -998,6 +1224,7 @@ class OCRTrackingThread(QThread):
                             continue
                         tracks[next_id] = self._new_track(frame, det[0], next_id, frame_no, det[1], det[2])
                         history[next_id] = {}
+                        created_track_ids_this_frame.append(next_id)
                         next_id += 1
 
                 # Export masks for live tracks. During a short loss, use a growing
@@ -1005,7 +1232,7 @@ class OCRTrackingThread(QThread):
                 # the target immediately. Long losses are marked for manual review.
                 frame_rois, monitor_tracks = [], {}
                 for tid, tr in tracks.items():
-                    if tr['lost'] > self.MAX_LOST_FRAMES:
+                    if tr['lost'] > self.CONSERVATIVE_MASK_FRAMES:
                         continue
                     roi = tuple(map(int, self._clip(frame, tr['roi'])))
                     monitor_tracks[tid] = tr
@@ -1016,10 +1243,13 @@ class OCRTrackingThread(QThread):
                         predicted_roi = tr.get('predicted_roi') or tr['roi']
                         px, py, pw, ph = self._clip(frame, predicted_roi)
                         cx, cy = px + pw / 2.0, py + ph / 2.0
-                        scale = 1.0 + 0.18 * tr['lost']
+                        scale = min(2.4, 1.0 + 0.14 * tr['lost'])
                         mask_roi = self._clip(frame, (cx-pw*scale/2, cy-ph*scale/2,
                                                       pw*scale, ph*scale))
-                    history.setdefault(tid, {})[frame_no] = mask_roi
+                    # A conservative prediction may still be used for immediate masking, but it is
+                    # NOT considered OCR/measurement-confirmed history. Mark it as a gap so the
+                    # segment backfill can re-check it instead of silently skipping it.
+                    history.setdefault(tid, {})[frame_no] = mask_roi if tr['lost'] == 0 else None
                     # Preserve separate masks for adjacent identical targets. Exact duplicate
                     # boxes are already controlled by one-to-one OCR assignment; overlapping
                     # masks are safer than silently dropping a neighbouring target.
@@ -1027,39 +1257,221 @@ class OCRTrackingThread(QThread):
                         if not any(self._iou(mask_roi, old) > .985 for old in frame_rois):
                             frame_rois.append(tuple(map(int, mask_roi)))
                 data[frame_no] = frame_rois
+
+                # Critical fix: a newly OCR-detected target has no history before its first
+                # detection. Trace its path backward immediately to the tracking start frame.
+                # This is separate from reacquisition-gap repair and runs for first detections too.
+                if reader is not None and self.target_text.strip() and created_track_ids_this_frame:
+                    new_track_history = {
+                        _tid: history.get(_tid, {})
+                        for _tid in created_track_ids_this_frame
+                    }
+                    self._report(
+                        'first_detection_backfill_start',
+                        f'首次 OCR 偵測後立即反向追蹤：{len(created_track_ids_this_frame)} 個新目標，'
+                        f'從 F{frame_no} 回溯至 F{hit_frame}。',
+                        frame_no, track_ids=created_track_ids_this_frame,
+                        from_frame=frame_no, to_frame=hit_frame,
+                        first_detection_backfill=True)
+                    _backfill_result = self._retroactively_search_before_first_detection(
+                        cap, new_track_history, hit_frame, frame_no,
+                        frame_w, frame_h, reader)
+                    # Merge every predicted/OCR-confirmed ROI into the full per-frame history
+                    # and the actual export dictionary. The exporter reads only tracking_data.
+                    for _tid, _local_track_history in new_track_history.items():
+                        _full_history = history.setdefault(_tid, {})
+                        for _f, _roi in _local_track_history.items():
+                            if _roi is not None:
+                                _full_history[_f] = tuple(map(int, _roi))
+                                _rois = list(data.get(_f, []))
+                                if not any(self._iou(_roi, _old) > .985 for _old in _rois):
+                                    _rois.append(tuple(map(int, _roi)))
+                                data[_f] = _rois
+                    self._report(
+                        'first_detection_backfill_done',
+                        f'首次偵測前回溯完成：檢查 {_backfill_result["checked"]} 幀，'
+                        f'OCR 確認 {_backfill_result["matched"]} 幀；反向推估框已寫入匯出資料。',
+                        frame_no, first_detection_backfill=True,
+                        retro_checked=_backfill_result["checked"],
+                        retro_matched=_backfill_result["matched"],
+                        backfilled_frames=sum(
+                            1 for _tid in created_track_ids_this_frame
+                            for _f, _roi in history.get(_tid, {}).items()
+                            if hit_frame <= _f < frame_no and _roi is not None))
+                    # The backward helper seeks to old frames; restore forward decoder position.
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no + 1)
+
+                # If OCR reacquires a previously lost track, immediately backfill the gap
+                # instead of waiting for the next 90-frame scheduled segment check.
+                if (self.IMMEDIATE_RETRACE_ON_REACQUISITION and reader is not None
+                        and reacquired_events and self.target_text.strip()):
+                    for _tid, _lost_count, _reacquired_frame in reacquired_events:
+                        _track_history = history.get(_tid, {})
+                        _anchors = [f for f, r in _track_history.items()
+                                    if f < _reacquired_frame and r is not None]
+                        if not _anchors:
+                            continue
+                        _left_anchor = max(_anchors)
+                        _gap = _reacquired_frame - _left_anchor - 1
+                        if _gap <= 0 or _gap > self.RETRO_OCR_MAX_GAP:
+                            continue
+                        _local_history = {
+                            _tid: {f: _track_history.get(f) for f in range(_left_anchor, _reacquired_frame + 1)}
+                        }
+                        self._report('reacquisition_backfill_start',
+                            f'目標重新找到：立即回溯 ID {_tid}，F{_left_anchor} 至 F{_reacquired_frame}，缺口 {_gap} 幀。',
+                            _reacquired_frame, track_id=_tid, gap=_gap,
+                            from_frame=_left_anchor, to_frame=_reacquired_frame,
+                            immediate_backfill=True)
+                        _checked = self._retroactively_verify_gaps(
+                            cap, _local_history, _left_anchor, _reacquired_frame,
+                            frame_w, frame_h, reader)
+                        for _f, _roi in _local_history.get(_tid, {}).items():
+                            if _roi is not None:
+                                _track_history[_f] = tuple(map(int, _roi))
+                        _path_filled = self._interpolate_path_gaps(
+                            _local_history, max_gap=self.MAX_PATH_INTERPOLATION_GAP)
+                        # Display sampled path masks so the monitor distinguishes measured OCR boxes
+                        # from interpolated privacy masks. Avoid flooding the GUI with every frame.
+                        for _idx, (_path_tid, _path_frame, _path_roi, _left, _right) in enumerate(_path_filled):
+                            if _idx % 3 == 0:
+                                _left_roi = _local_history[_tid].get(_left)
+                                _right_roi = _local_history[_tid].get(_right)
+                                if _left_roi is not None and _right_roi is not None:
+                                    self._draw_path_backfill(cap, _path_frame, _tid, _path_roi,
+                                        _left, _right, _left_roi, _right_roi, resume_frame=frame_no + 1)
+                        for _f, _roi in _local_history.get(_tid, {}).items():
+                            if _roi is not None:
+                                _track_history[_f] = tuple(map(int, _roi))
+                        for _f in range(_left_anchor, _reacquired_frame + 1):
+                            _rois = list(data.get(_f, []))
+                            _roi = _track_history.get(_f)
+                            if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
+                                _rois.append(tuple(map(int, _roi)))
+                            data[_f] = _rois
+                        self._report('reacquisition_backfill_done',
+                            f'立即回溯完成：ID {_tid}，OCR 檢查 {_checked} 次，路徑補遮 {_path_filled.__len__()} 幀。',
+                            _reacquired_frame, track_id=_tid, retro_checked=_checked,
+                            path_filled=len(_path_filled), gap=_gap, immediate_backfill=True)
+                        # Retro OCR seeks backward; restore forward reading position.
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no + 1)
+
+                # Publish live frames regularly, plus every OCR/recovery event.
                 if frame_no % self.MONITOR_INTERVAL == 0 or ran_ocr or need_local_recovery:
                     self._draw_monitor(frame, frame_no, monitor_tracks, 'RECOVERY MODE' if need_local_recovery else 'TRACK MODE')
+
+                # Every segment, perform OCR checks on recent gaps while forward tracking continues.
+                # The backward scan is bounded to this segment plus the configured gap context.
+                if (reader is not None and self.target_text.strip()
+                        and self.RETROACTIVE_SEGMENT_INTERVAL > 0
+                        and (frame_no - hit_frame + 1) % self.RETROACTIVE_SEGMENT_INTERVAL == 0):
+                    segment_start = max(hit_frame, frame_no - self.RETROACTIVE_SEGMENT_INTERVAL + 1 - self.RETRO_OCR_MAX_GAP)
+                    segment_history = {}
+                    for _tid, _track_history in history.items():
+                        segment_history[_tid] = {
+                            _f: _roi for _f, _roi in _track_history.items()
+                            if segment_start <= _f <= frame_no
+                        }
+                    self._report('retroactive_check',
+                        f'開始分段回溯：F{segment_start} 至 F{frame_no}，檢查最近一段的追蹤缺口。',
+                        frame_no, segment_start=segment_start, segment_end=frame_no,
+                        retroactive_segment=True)
+                    checked_now = self._retroactively_verify_gaps(
+                        cap, segment_history, segment_start, frame_no, frame_w, frame_h, reader)
+                    # Merge only newly OCR-verified boxes back into the full history.
+                    for _tid, _segment_track_history in segment_history.items():
+                        _full_history = history.setdefault(_tid, {})
+                        for _f, _roi in _segment_track_history.items():
+                            if _roi is not None:
+                                _full_history[_f] = tuple(map(int, _roi))
+                    # Reflect retroactive detections in the data that will be exported as mosaic.
+                    for _f in range(segment_start, frame_no + 1):
+                        _rois = list(data.get(_f, []))
+                        for _track_history in history.values():
+                            _roi = _track_history.get(_f)
+                            if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
+                                _rois.append(tuple(map(int, _roi)))
+                        data[_f] = _rois
+                    self._report('retroactive_segment_done',
+                        f'分段回溯結束：本段檢查 {checked_now} 個缺漏影格；已更新馬賽克追蹤資料。',
+                        frame_no, retro_checked=checked_now, segment_start=segment_start,
+                        segment_end=frame_no, retroactive_segment=True)
+                    # The backward OCR helper seeks around the file; restore the next forward frame.
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no + 1)
                 if ran_ocr or need_local_recovery:
                     diagnostic_tracks = [t for t in tracks.values() if t.get('lost', 0) > 0]
                     diagnosis = ', '.join(f"ID {t['id']}:{t.get('loss_reason') or 'recovering'}" for t in diagnostic_tracks[:4])
-                    summary = f'；失追診斷={diagnosis}' if diagnosis else ''
-                    self._report('tracking', f'影格 {frame_no}：追蹤 {len(tracks)}，局部恢復 {len(need_local_recovery)}，OCR 框 {len(detections)}{summary}',
+                    summary = f'追蹤診斷={diagnosis}' if diagnosis else ''
+                    self._report('tracking', f'影格 {frame_no}：追蹤數 {len(tracks)}，待恢復 {len(need_local_recovery)}，OCR 候選 {len(detections)}；{summary}',
                                  frame_no, target_count=len(tracks), lost_count=len(need_local_recovery),
                                  detection_count=len(detections), diagnosis=diagnosis,
                                  global_motion=global_motion, camera_motion_suspected=camera_moving,
                                  fps=source_fps, mode='RECOVERY MODE' if need_local_recovery else 'TRACK MODE')
-                self.progress_signal.emit(frame_no, f'TRACK F{frame_no}/{end_frame}，有效框 {len(frame_rois)}')
+                self.progress_signal.emit(frame_no, f'追蹤中 F{frame_no}/{end_frame}；本幀遮罩 {len(frame_rois)} 個')
                 previous_gray = current_gray
 
-            # Stage 1: fill missing frames between known positions.
-            retro_checked = 0
-            if reader is not None and self.target_text.strip() and last_frame >= hit_frame:
-                retro_checked = self._retroactively_verify_gaps(
-                    cap, history, hit_frame, last_frame, frame_w, frame_h, reader)
-
-                # Stage 2: search BEFORE each track's first known position. This handles
-                # targets first discovered only at a sparse global OCR keyframe.
-                first_result = self._retroactively_search_before_first_detection(
-                    cap, history, hit_frame, last_frame, frame_w, frame_h, reader)
+            # Process a final partial segment as well (e.g. if the user cancels mid-segment).
+            # This remains a bounded local pass, not a full-video end reverse scan.
+            frames_in_run = max(0, last_frame - hit_frame + 1)
+            if (reader is not None and self.target_text.strip()
+                    and self.RETROACTIVE_SEGMENT_INTERVAL > 0 and frames_in_run > 0
+                    and frames_in_run % self.RETROACTIVE_SEGMENT_INTERVAL != 0):
+                segment_start = max(hit_frame, last_frame - self.RETROACTIVE_SEGMENT_INTERVAL + 1 - self.RETRO_OCR_MAX_GAP)
+                segment_history = {
+                    _tid: {_f: _roi for _f, _roi in _track_history.items()
+                           if segment_start <= _f <= last_frame}
+                    for _tid, _track_history in history.items()
+                }
                 self._report('retroactive_check',
-                    f'回溯總結：已知缺口檢查 {retro_checked} 幀；首次偵測前檢查 '
-                    f'{first_result["checked"]} 幀、OCR 確認補到 {first_result["matched"]} 幀',
-                    last_frame, retro_checked=retro_checked,
-                    first_detection_checked=first_result['checked'],
-                    first_detection_matched=first_result['matched'],
-                    max_gap=self.RETRO_OCR_MAX_GAP)
+                    f'開始最後一段回溯：F{segment_start} 至 F{last_frame}。',
+                    last_frame, segment_start=segment_start, segment_end=last_frame,
+                    retroactive_segment=True, final_partial_segment=True)
+                checked_now = self._retroactively_verify_gaps(
+                    cap, segment_history, segment_start, last_frame, frame_w, frame_h, reader)
+                for _tid, _segment_track_history in segment_history.items():
+                    _full_history = history.setdefault(_tid, {})
+                    for _f, _roi in _segment_track_history.items():
+                        if _roi is not None:
+                            _full_history[_f] = tuple(map(int, _roi))
+                for _f in range(segment_start, last_frame + 1):
+                    _rois = list(data.get(_f, []))
+                    for _track_history in history.values():
+                        _roi = _track_history.get(_f)
+                        if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
+                            _rois.append(tuple(map(int, _roi)))
+                    data[_f] = _rois
+                self._report('retroactive_segment_done',
+                    f'最後一段回溯完成：檢查 {checked_now} 個缺漏影格。', last_frame,
+                    retro_checked=checked_now, segment_start=segment_start,
+                    segment_end=last_frame, retroactive_segment=True, final_partial_segment=True)
 
+            # Do not run a second full reverse scan after the whole video ends.
+            self._report('retroactive_check',
+                         '分段回溯補查已完成；未啟用整段影片結束後的額外反向掃描。',
+                         last_frame, retroactive_mode='per_segment',
+                         segment_interval=self.RETROACTIVE_SEGMENT_INTERVAL,
+                         end_reverse_check=False, cancelled=self.was_cancelled)
+
+            # First run OCR backfill; then use bounded path interpolation for residual gaps.
+            # This creates an ROI for each frame between known endpoints when the gap is short
+            # enough, so export applies mosaic frame-by-frame rather than blurring a whole path strip.
+            path_filled = self._interpolate_path_gaps(
+                history, max_gap=self.MAX_PATH_INTERPOLATION_GAP)
+            # At end-of-run, visualize a sample of the path masks that were inferred after OCR backfill.
+            for _idx, (_tid, _path_frame, _path_roi, _left, _right) in enumerate(path_filled):
+                if _idx % 3 == 0:
+                    _left_roi = history.get(_tid, {}).get(_left)
+                    _right_roi = history.get(_tid, {}).get(_right)
+                    if _left_roi is not None and _right_roi is not None:
+                        self._draw_path_backfill(cap, _path_frame, _tid, _path_roi,
+                            _left, _right, _left_roi, _right_roi, resume_frame=last_frame + 1)
             self._interpolate_short_gaps(history, self.INTERPOLATE_MAX_GAP)
+            if path_filled:
+                self._report('path_backfill_done',
+                    f'路徑補遮完成：依前後有效 ROI 補上 {len(path_filled)} 個影格的逐幀遮罩。',
+                    last_frame, path_filled=len(path_filled),
+                    max_path_gap=self.MAX_PATH_INTERPOLATION_GAP,
+                    path_mask_expand=self.PATH_MASK_EXPAND)
             for f in range(hit_frame, last_frame+1):
                 rois = list(data.get(f, []))
                 for th in history.values():
@@ -1068,10 +1480,12 @@ class OCRTrackingThread(QThread):
                         rois.append(tuple(map(int, roi)))
                 data[f] = rois
             success = any(bool(v) for v in data.values())
-            self._report('finished', '追蹤完成', last_frame, tracked_frames=len(data),
-                         target_count=max((len(v) for v in data.values()), default=0), success=success)
+            finish_message = '追蹤已中止；已保留中止前的追蹤資料' if self.was_cancelled else '追蹤完成'
+            self._report('finished', finish_message, last_frame, tracked_frames=len(data),
+                         target_count=max((len(v) for v in data.values()), default=0),
+                         success=success, cancelled=self.was_cancelled)
         except Exception as exc:
-            self._report('error', f'執行錯誤：{type(exc).__name__}: {exc}', last_frame)
+            self._report('error', f'追蹤發生錯誤：{type(exc).__name__}: {exc}', last_frame)
             success = any(bool(v) for v in data.values())
         finally:
             if cap is not None:
@@ -1083,9 +1497,10 @@ class VideoProcessorThread(QThread):
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, video_path, output_path, mosaic_tasks):
+    def __init__(self, video_path, output_path, mosaic_tasks, end_frame=None):
         super().__init__()
         self.video_path, self.output_path, self.mosaic_tasks = video_path, output_path, mosaic_tasks
+        self.end_frame = None if end_frame is None else max(0, int(end_frame))
 
     @staticmethod
     def _apply_mosaic(frame, roi, strength):
@@ -1119,13 +1534,15 @@ class VideoProcessorThread(QThread):
             self.finished_signal.emit(""); return
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        source_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        limit_frame = source_total - 1 if self.end_frame is None else min(source_total - 1, self.end_frame)
+        total = max(0, limit_frame + 1)
         out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         if not out.isOpened():
             cap.release(); self.finished_signal.emit(""); return
         current = 0
         try:
-            while True:
+            while current <= limit_frame:
                 ret, frame = cap.read()
                 if not ret:
                     break
