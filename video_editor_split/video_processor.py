@@ -1,4 +1,4 @@
-"""Multi-target tracking + sparse full-frame/local RapidOCR verification + mosaic export.
+﻿"""Multi-target tracking + sparse full-frame/local RapidOCR verification + mosaic export.
 
 Requires: opencv-contrib-python, rapidocr-onnxruntime, PyQt5. EasyOCR/PyTorch is not used.
 tracking_data format: {absolute_frame_index: [(x, y, w, h), ...]}
@@ -107,7 +107,7 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 15          # 每隔 15 幀進行一次全畫面 OCR 檢查。
+    GLOBAL_OCR_INTERVAL = 5           # 快速位移時更頻繁全畫面 OCR，降低錯過新位置的時間。
     LOCAL_RECOVERY_INTERVAL = 3       # 追蹤遺失時約每 3 幀重試一次局部 OCR，不採用長時間指數退避
     MAX_OCR_ROI_DIM = 800             # 局部 OCR 搜尋區域的最大尺寸。
     MAX_GLOBAL_OCR_DIM = 1280         # 全畫面 OCR 的縮放尺寸上限。
@@ -118,9 +118,9 @@ class OCRTrackingThread(QThread):
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
     MONITOR_INTERVAL = 2  # Update the live preview about 15 times/second at 30 FPS.
-    RETROACTIVE_SEGMENT_INTERVAL = 90  # 每 90 幀進行一次分段回溯
+    RETROACTIVE_SEGMENT_INTERVAL = 30  # 更頻繁檢查近期追蹤路徑。
     INTERPOLATE_MAX_GAP = 2  # 保留舊的短缺口設定，路徑補遮另有獨立上限
-    MAX_PATH_INTERPOLATION_GAP = 45  # 兩個可靠位置之間最多以路徑補遮 45 幀（30 FPS 約 1.5 秒）
+    MAX_PATH_INTERPOLATION_GAP = 120  # OCR 仍無法確認時，最多以較寬路徑遮罩補 120 幀。
     PATH_MASK_EXPAND = 1.20  # 路徑推估 ROI 稍微擴大，降低位置估計誤差造成的漏遮
     # 自適應框穩定：小幅抖動時加強平滑，大幅移動時提高反應速度。
     STABLE_CENTER_DEADBAND_RATIO = 0.012
@@ -129,7 +129,7 @@ class OCRTrackingThread(QThread):
     RETRO_OCR_MAX_GAP = 120  # 回溯 OCR 檢查的最大缺口幀數。
     RETRO_ROI_EXPAND = 2.2  # 回溯時擴大局部搜尋範圍。
     USE_MSER_PREFILTER = False  # Avoid MSER false negatives blocking OCR.
-    ENABLE_END_REVERSE_CHECK = False  # Disable post-run reverse OCR; keep forward tracking and local recovery.
+    ENABLE_END_REVERSE_CHECK = False  # 不做整部影片反掃；重新取得目標時會強制 OCR 回查前段。
     FRAME_CACHE_MAX_FRAMES = 12
     FRAME_CACHE_MAX_BYTES = 96 * 1024 * 1024  # Hard cap: 96 MiB of cached source frames.
 
@@ -143,6 +143,9 @@ class OCRTrackingThread(QThread):
         self.frame_buffer = None  # Created in run() after video metadata is available.
         self.was_cancelled = False
         self.cancel_frame = self.start_frame
+        # Remember completed OCR-anchor pairs. Without this guard, each periodic segment
+        # can repeatedly OCR the same gap and appear to be stuck in backtracking.
+        self._processed_retro_pairs = set()
         # Per-frame visual diagnostics consumed by the live monitor overlay.
         self._monitor_overlay = {'frame': -1, 'search_roi': None, 'candidates': [],
                                  'ocr_mode': '', 'ocr_elapsed': 0.0, 'target_count': 0,
@@ -165,6 +168,38 @@ class OCRTrackingThread(QThread):
     def _report(self, stage, message, frame_no=None, **extra):
         self.monitor_data_signal.emit({'stage': stage, 'message': message,
             'frame': frame_no, 'clock': time.monotonic(), **extra})
+
+    def _pending_anchor_pair_histories(self, ocr_history, start_frame, end_frame):
+        """Build only unprocessed gaps between adjacent OCR-confirmed anchors.
+
+        Tracker/Kalman prediction boxes are deliberately NOT used as anchors. A recovery
+        box can be orange and visibly misplaced; treating it as a trusted endpoint makes
+        the backfill confidently follow the wrong path. Each pair is checked at most once.
+        """
+        pending = {}
+        max_gap = max(0, int(self.RETRO_OCR_MAX_GAP))
+        if max_gap <= 0:
+            return pending
+        for track_id, trusted in ocr_history.items():
+            anchors = sorted(
+                int(f) for f, roi in trusted.items()
+                if start_frame <= int(f) <= end_frame and roi is not None
+            )
+            for left, right in zip(anchors, anchors[1:]):
+                gap = right - left - 1
+                if gap <= 0 or gap > max_gap:
+                    continue
+                pair_key = (int(track_id), int(left), int(right))
+                if pair_key in self._processed_retro_pairs:
+                    continue
+                # Synthetic key lets one batch contain several gaps for the same ID
+                # while sharing a single OCR result for any frame used by multiple IDs.
+                local = {f: None for f in range(left, right + 1)}
+                local[left] = tuple(map(int, trusted[left]))
+                local[right] = tuple(map(int, trusted[right]))
+                pending[pair_key] = local
+                self._processed_retro_pairs.add(pair_key)
+        return pending
 
     @staticmethod
     def _clip(frame, roi):
@@ -646,86 +681,246 @@ class OCRTrackingThread(QThread):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(resume_frame))
 
     def _retroactively_verify_gaps(self, cap, history, start_frame, end_frame,
-                                   frame_w, frame_h, reader):
-        """對追蹤歷史中的缺漏區段進行回溯 OCR 驗證。
+                                   frame_w, frame_h, reader, force_check=False):
+        """跨影格批次 OCR 回溯 + 自適應路徑最佳化。
 
-        使用前後已知位置建立搜尋區域，再以 OCR 確認可能的目標框。
-        只處理不超過 RETRO_OCR_MAX_GAP 的缺口，避免無界回溯。
-        OCR 確認成功的框會寫回 history；未確認的影格仍保留為 None。
+        核心設計：
+        1. 先按影格收集所有 ID 的工作，同一影格只解碼一次、只執行一次全畫面 OCR。
+        2. 不用固定半徑直接淘汰遠距離候選；大位移候選仍可進入路徑評分。
+        3. 每個錨點區間用動態規劃比較整段候選路徑，考慮位置、位移、加速度、框尺寸與 OCR 信心。
+        4. 線性插值只作為弱先驗，不會把搜尋限制在插值框附近。
+        5. 未確認的影格保留 None，交給既有的路徑補遮策略；不把推估位置冒充 OCR 確認。
         """
-        checked = 0
-        matched = 0
+        checked = matched = 0
         max_gap = max(0, int(self.RETRO_OCR_MAX_GAP))
-        if max_gap == 0:
-            self._report('retroactive_check', '回溯補查已停用：RETRO_OCR_MAX_GAP 設為 0', end_frame,
-                         retro_checked=0, retro_matched=0, max_gap=max_gap)
-            return checked
-
         target = self._normalize(self.target_text)
-        if not target:
-            return checked
+        if max_gap <= 0 or not target or reader is None:
+            self._report('retroactive_check', '批次回溯略過：OCR、目標文字或回溯上限未設定',
+                         end_frame, retro_checked=0, retro_matched=0, max_gap=max_gap,
+                         batch_backfill=True)
+            return 0
 
+        # 一段 segment 是同一 ID 的兩個可信錨點及其中間缺口。
+        segments = []
+        frame_jobs = {}
         for track_id, track_history in history.items():
             valid_frames = sorted(f for f, roi in track_history.items() if roi is not None)
             for left, right in zip(valid_frames, valid_frames[1:]):
-                gap = right - left - 1
+                gap = int(right) - int(left) - 1
                 if gap <= 0 or gap > max_gap:
                     continue
-                a, b = track_history[left], track_history[right]
-                missing = [f for f in range(left + 1, right)
-                           if track_history.get(f) is None]
-                if not missing:
+                frames = [f for f in range(int(left) + 1, int(right))
+                          if int(start_frame) <= f <= int(end_frame)]
+                if not frames:
                     continue
-                self._report('retroactive_check',
-                    f'分段回溯：ID {track_id}，F{left} 到 F{right}，檢查缺漏 {len(missing)} 幀',
-                    right, track_id=track_id, gap=gap, retro_checked=checked,
-                    retro_matched=matched, max_gap=max_gap)
-                for frame_no in missing:
-                    ratio = (frame_no - left) / float(right - left)
-                    predicted = tuple(int(round(a[i] * (1-ratio) + b[i] * ratio)) for i in range(4))
-                    frame = self._read_frame_at(cap, frame_no)
-                    if frame is None:
+                segment = {
+                    'track_id': track_id, 'history': track_history,
+                    'left': int(left), 'right': int(right),
+                    'left_roi': tuple(track_history[left]), 'right_roi': tuple(track_history[right]),
+                    'frames': frames,
+                }
+                segments.append(segment)
+                for f in frames:
+                    if force_check:
+                        track_history[f] = None
+                    elif track_history.get(f) is not None:
                         continue
-                    pred = self._clip(frame, predicted)
-                    search_roi = self._expand_roi(frame, pred, self.RETRO_ROI_EXPAND)
-                    self._draw_reverse_check(frame, frame_no, track_id, pred, None,
-                                             f"缺漏影格 OCR 補查 #{checked+1}")
-                    detections, _ = self._ocr(reader, frame, frame_no,
-                                              roi=search_roi, full_frame=False, robust=True)
-                    checked += 1
-                    candidates = [d for d in detections
-                                  if target in self._normalize(d[1])]
-                    if not candidates:
-                        self._report('retroactive_global_fallback',
-                            f'F{frame_no} 局部回溯未匹配，改做全畫面 OCR', frame_no,
-                            track_id=track_id, search_roi=search_roi)
-                        global_detections, _ = self._ocr(
-                            reader, frame, frame_no, full_frame=True, robust=True)
-                        checked += 1
-                        detections.extend(global_detections)
-                        candidates = [d for d in global_detections
-                                      if target in self._normalize(d[1])]
-                    self._draw_reverse_check(
-                        frame, frame_no, track_id, pred, None,
-                        f"補查完成：候選 {len(self._monitor_overlay.get('candidates', []))}，匹配 {len(candidates)}")
-                    if candidates:
-                        # 說明：此處依追蹤狀態執行相應處理。
-                        candidates.sort(key=lambda d: math.hypot(
-                            self._center(d[0])[0] - self._center(pred)[0],
-                            self._center(d[0])[1] - self._center(pred)[1]))
-                        track_history[frame_no] = tuple(map(int, self._clip(frame, candidates[0][0])))
-                        matched += 1
-                        self._draw_reverse_check(frame, frame_no, track_id, pred,
-                                                 track_history[frame_no], "OCR 已確認")
-                        self._report('retroactive_match',
-                            f'回溯補到目標：F{frame_no}，ID {track_id}', frame_no,
-                            track_id=track_id, roi=track_history[frame_no],
-                            retro_checked=checked, retro_matched=matched)
+                    frame_jobs.setdefault(f, True)
+
+        if not frame_jobs:
+            self._report('retroactive_check', '自適應批次回溯完成：沒有符合條件的缺口影格',
+                         end_frame, retro_checked=0, retro_matched=0,
+                         max_gap=max_gap, batch_backfill=True)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(end_frame))
+            return 0
+
+        # 每個獨立影格只 OCR 一次，保存該影格全部符合目標文字的候選框。
+        detections_by_frame = {}
+        frames_to_scan = sorted(frame_jobs)
+        for frame_no in frames_to_scan:
+            if self.was_cancelled:
+                break
+            frame = self._read_frame_at(cap, frame_no)
+            if frame is None:
+                detections_by_frame[frame_no] = []
+                continue
+            try:
+                detections, _ = self._ocr(reader, frame, frame_no, full_frame=True, robust=True)
+            except Exception as exc:
+                detections = []
+                self._report('retroactive_ocr_error',
+                    f'批次回溯 F{frame_no} OCR 失敗：{exc}', frame_no,
+                    batch_backfill=True)
+            detections_by_frame[frame_no] = list(detections or [])
+            checked += 1
+            self._report('retroactive_frame',
+                f'自適應回溯 OCR：F{frame_no}，候選 {len(detections_by_frame[frame_no])}',
+                frame_no, detections=len(detections_by_frame[frame_no]), batch_backfill=True)
+
+        frame_diag = max(1.0, math.hypot(float(frame_w), float(frame_h)))
+
+        def center(box):
+            return self._center(box)
+
+        def box_size_cost(box, anchor):
+            # 對數比例讓尺寸變化的懲罰平滑，不會因尺度變化就直接拒絕候選。
+            bw, bh = max(2.0, float(box[2])), max(2.0, float(box[3]))
+            aw, ah = max(2.0, float(anchor[2])), max(2.0, float(anchor[3]))
+            return abs(math.log(bw / aw)) + abs(math.log(bh / ah))
+
+        def candidate_conf(det):
+            try:
+                return max(0.0, min(1.0, float(det[2]))) if len(det) > 2 else 0.5
+            except Exception:
+                return 0.5
+
+        # 逐段做 Viterbi/動態規劃。每個中間影格都有 OCR 候選；None 是允許的空缺狀態。
+        for segment in segments:
+            if self.was_cancelled:
+                break
+            track_history = segment['history']
+            raw_track_id = segment['track_id']
+            display_track_id = (raw_track_id[0]
+                                if isinstance(raw_track_id, tuple) and len(raw_track_id) == 3
+                                else raw_track_id)
+            left, right = segment['left'], segment['right']
+            left_roi, right_roi = segment['left_roi'], segment['right_roi']
+            frames = [f for f in segment['frames']
+                      if force_check or track_history.get(f) is None]
+            if not frames:
+                continue
+
+            # 每一層的狀態為候選 OCR 框索引；-1 代表該影格不採信 OCR，留給補遮策略。
+            layers = []
+            for f in frames:
+                dets = detections_by_frame.get(f, [])
+                frame = self._read_frame_at(cap, f)
+                if frame is None:
+                    layers.append([{'roi': None, 'det': None, 'emission': 1.05, 'confidence': 0.0}])
+                    continue
+                candidates = []
+                ratio = (f - left) / float(max(1, right - left))
+                interp = tuple(left_roi[i] * (1-ratio) + right_roi[i] * ratio for i in range(4))
+                ix, iy, iw, ih = interp
+                interp_box = (ix, iy, max(2.0, iw), max(2.0, ih))
+                interp_cx, interp_cy = center(interp_box)
+                # 保留全部目標文字候選，不用固定搜尋框/固定最大距離截斷。
+                for det in dets:
+                    try:
+                        roi = tuple(map(float, self._clip(frame, det[0])))
+                        if roi[2] < 2 or roi[3] < 2:
+                            continue
+                        dcx, dcy = center(roi)
+                        distance = math.hypot(dcx - interp_cx, dcy - interp_cy) / frame_diag
+                        confidence = candidate_conf(det)
+                        # 插值距離只佔較低權重，遠距離不會被硬性淘汰。
+                        emission = 0.90 * min(2.0, distance * 5.0)
+                        emission += 0.16 * min(3.0, box_size_cost(roi, left_roi))
+                        emission += 0.16 * min(3.0, box_size_cost(roi, right_roi))
+                        emission += 0.55 * (1.0 - confidence)
+                        candidates.append({'roi': roi, 'det': det, 'emission': emission,
+                                           'confidence': confidence})
+                    except Exception:
+                        continue
+                # 不強迫每幀一定要配對，降低錯誤 OCR 框被硬塞進軌跡的風險。
+                candidates.append({'roi': None, 'det': None, 'emission': 1.05, 'confidence': 0.0})
+                layers.append(candidates)
+
+            if not layers:
+                continue
+
+            # 每一層的累積成本與回溯指標。
+            costs = []
+            parents = []
+            previous_states = [{'roi': left_roi, 'emission': 0.0, 'confidence': 1.0}]
+            previous_costs = [0.0]
+            previous_frame = left
+            for layer_index, (frame_no, layer) in enumerate(zip(frames, layers)):
+                current_costs, current_parents = [], []
+                dt = max(1, int(frame_no) - int(previous_frame))
+                for ci, cand in enumerate(layer):
+                    best_cost, best_parent = float('inf'), 0
+                    for pi, prev in enumerate(previous_states):
+                        prev_cost = previous_costs[pi]
+                        if cand['roi'] is None:
+                            transition = 0.10 if prev.get('roi') is None else 0.22
+                        elif prev.get('roi') is None:
+                            transition = 0.18
+                        else:
+                            pcx, pcy = center(prev['roi'])
+                            ccx, ccy = center(cand['roi'])
+                            displacement = math.hypot(ccx-pcx, ccy-pcy) / frame_diag
+                            # 飽和型位移成本：大幅移動增加成本，但不會被硬門檻淘汰。
+                            transition = 0.72 * min(2.0, displacement * 5.0 / max(1.0, math.sqrt(dt)))
+                            transition += 0.12 * min(3.0, box_size_cost(cand['roi'], prev['roi']))
+                            # 用上一段速度做柔性加速度懲罰；只在已有前一個移動狀態時生效。
+                            if pi < len(previous_states) and prev.get('prev_center') is not None:
+                                vx = (ccx-pcx) / dt
+                                vy = (ccy-pcy) / dt
+                                pvx, pvy = prev['velocity']
+                                accel = math.hypot(vx-pvx, vy-pvy) / frame_diag
+                                transition += 0.12 * min(2.0, accel * 8.0)
+                        value = prev_cost + float(cand['emission']) + transition
+                        if value < best_cost:
+                            best_cost, best_parent = value, pi
+                    current_costs.append(best_cost)
+                    current_parents.append(best_parent)
+                costs.append(current_costs)
+                parents.append(current_parents)
+
+                # 為下一層狀態附上速度資訊，以便評估加速度；空缺狀態不虛構速度。
+                next_states = []
+                for ci, cand in enumerate(layer):
+                    state = {'roi': cand['roi'], 'emission': cand['emission'],
+                             'confidence': cand['confidence'], 'prev_center': None,
+                             'velocity': (0.0, 0.0)}
+                    parent_state = previous_states[current_parents[ci]]
+                    if cand['roi'] is not None and parent_state.get('roi') is not None:
+                        cc = center(cand['roi'])
+                        pc = center(parent_state['roi'])
+                        state['prev_center'] = pc
+                        state['velocity'] = ((cc[0]-pc[0]) / dt, (cc[1]-pc[1]) / dt)
+                    next_states.append(state)
+                previous_states, previous_costs = next_states, current_costs
+                previous_frame = frame_no
+
+            # 將右錨點納入終端成本，避免只看前向局部最優。
+            terminal_costs = []
+            for state, base_cost in zip(previous_states, previous_costs):
+                if state.get('roi') is None:
+                    terminal_costs.append(base_cost + 0.35)
+                else:
+                    c1, c2 = center(state['roi']), center(right_roi)
+                    d = math.hypot(c1[0]-c2[0], c1[1]-c2[1]) / frame_diag
+                    terminal_costs.append(base_cost + 0.80 * min(2.0, d * 5.0))
+            idx = min(range(len(terminal_costs)), key=terminal_costs.__getitem__)
+            selected = [None] * len(layers)
+            for li in range(len(layers)-1, -1, -1):
+                selected[li] = idx
+                idx = parents[li][idx]
+
+            for f, layer, choice in zip(frames, layers, selected):
+                cand = layer[choice]
+                if cand['roi'] is None:
+                    continue
+                frame = self._read_frame_at(cap, f)
+                if frame is None:
+                    continue
+                measured = tuple(map(int, self._clip(frame, cand['roi'])))
+                track_history[f] = measured
+                matched += 1
+                self._draw_reverse_check(frame, f, display_track_id, measured, measured,
+                                         '自適應路徑回溯：OCR 候選經跨影格評分')
+                self._report('retroactive_match',
+                    f'自適應路徑回溯補到目標：F{f}，ID {display_track_id}', f,
+                    track_id=display_track_id, roi=measured, retro_checked=checked,
+                    retro_matched=matched, batch_backfill=True, adaptive_path=True)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(end_frame))
         self._report('retroactive_check',
-            f'分段回溯完成：檢查 {checked} 幀，OCR 成功補到 {matched} 幀',
-            end_frame, retro_checked=checked, retro_matched=matched, max_gap=max_gap)
+            f'自適應多目標批次回溯完成：共 OCR {checked} 個不同影格，確認 {matched} 個目標影格',
+            end_frame, retro_checked=checked, retro_matched=matched,
+            max_gap=max_gap, batch_backfill=True, adaptive_path=True)
         return checked
 
     def _retroactively_search_before_first_detection(self, cap, history, start_frame,
@@ -1000,6 +1195,9 @@ class OCRTrackingThread(QThread):
 
             # Start output history at the initialization frame.
             history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
+            # Only OCR/manual initialization frames are trusted anchors. Visual tracker boxes
+            # may drift after fast motion and must not be used as the left anchor for backfill.
+            ocr_history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
             data[hit_frame] = [tuple(t['roi']) for t in tracks.values()]
             self._draw_monitor(first_frame, hit_frame, tracks, 'TRACK MODE')
             previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
@@ -1357,6 +1555,8 @@ class OCRTrackingThread(QThread):
                             tr['kalman'].correct(corrected_box)
                         except Exception:
                             tr['kalman'] = SortMotionModel(corrected_box)
+                        history.setdefault(tid, {})[frame_no] = tuple(map(int, corrected_box))
+                        ocr_history.setdefault(tid, {})[frame_no] = tuple(map(int, corrected_box))
                         used_dets.add(j)
                     # Additional OCR instances become new tracks, but manual single ROI mode
                     # only creates new IDs when OCR matches the requested target text.
@@ -1374,6 +1574,7 @@ class OCRTrackingThread(QThread):
                             continue
                         tracks[next_id] = self._new_track(frame, det[0], next_id, frame_no, det[1], det[2])
                         history[next_id] = {}
+                        ocr_history[next_id] = {frame_no: tuple(map(int, det[0]))}
                         created_track_ids_this_frame.append(next_id)
                         next_id += 1
 
@@ -1420,13 +1621,18 @@ class OCRTrackingThread(QThread):
                         queued_track_count=len(set(all_created_track_ids)),
                         first_detection_backfill=True, batch_backfill=True)
 
-                # If OCR reacquires a previously lost track, immediately backfill the gap
-                # instead of waiting for the next 90-frame scheduled segment check.
+                # 若同一影格重新找回多個目標，將它們合併成一次批次回溯，
+                # 讓同一個 frame 的全畫面 OCR 結果可由所有 ID 共用。
                 if (self.IMMEDIATE_RETRACE_ON_REACQUISITION and reader is not None
                         and reacquired_events and self.target_text.strip()):
+                    _batch_local_history = {}
+                    _batch_meta = {}
+                    _batch_start = frame_no
+                    _batch_end = frame_no
                     for _tid, _lost_count, _reacquired_frame in reacquired_events:
                         _track_history = history.get(_tid, {})
-                        _anchors = [f for f, r in _track_history.items()
+                        _trusted_history = ocr_history.get(_tid, {})
+                        _anchors = [f for f, r in _trusted_history.items()
                                     if f < _reacquired_frame and r is not None]
                         if not _anchors:
                             continue
@@ -1434,45 +1640,64 @@ class OCRTrackingThread(QThread):
                         _gap = _reacquired_frame - _left_anchor - 1
                         if _gap <= 0 or _gap > self.RETRO_OCR_MAX_GAP:
                             continue
-                        _local_history = {
-                            _tid: {f: _track_history.get(f) for f in range(_left_anchor, _reacquired_frame + 1)}
+                        _batch_local_history[_tid] = {
+                            f: (_trusted_history.get(f) if f == _left_anchor else
+                                _trusted_history.get(f) if f == _reacquired_frame else None)
+                            for f in range(_left_anchor, _reacquired_frame + 1)
                         }
+                        # The current reacquisition must be OCR-confirmed before it can
+                        # serve as the right anchor; do not use a predicted tracker box.
+                        if _trusted_history.get(_reacquired_frame) is None:
+                            _batch_local_history.pop(_tid, None)
+                            continue
+                        self._processed_retro_pairs.add((int(_tid), int(_left_anchor), int(_reacquired_frame)))
+                        _batch_meta[_tid] = (_track_history, _left_anchor, _reacquired_frame, _gap)
+                        _batch_start = min(_batch_start, _left_anchor)
+                        _batch_end = max(_batch_end, _reacquired_frame)
                         self._report('reacquisition_backfill_start',
-                            f'目標重新找到：立即回溯 ID {_tid}，F{_left_anchor} 至 F{_reacquired_frame}，缺口 {_gap} 幀。',
+                            f'目標重新找到：加入批次回溯 ID {_tid}，F{_left_anchor} 至 F{_reacquired_frame}，缺口 {_gap} 幀。',
                             _reacquired_frame, track_id=_tid, gap=_gap,
                             from_frame=_left_anchor, to_frame=_reacquired_frame,
-                            immediate_backfill=True)
+                            immediate_backfill=True, batch_backfill=True)
+
+                    if _batch_local_history:
                         _checked = self._retroactively_verify_gaps(
-                            cap, _local_history, _left_anchor, _reacquired_frame,
-                            frame_w, frame_h, reader)
-                        for _f, _roi in _local_history.get(_tid, {}).items():
-                            if _roi is not None:
-                                _track_history[_f] = tuple(map(int, _roi))
-                        _path_filled = self._interpolate_path_gaps(
-                            _local_history, max_gap=self.MAX_PATH_INTERPOLATION_GAP)
-                        # Display sampled path masks so the monitor distinguishes measured OCR boxes
-                        # from interpolated privacy masks. Avoid flooding the GUI with every frame.
-                        for _idx, (_path_tid, _path_frame, _path_roi, _left, _right) in enumerate(_path_filled):
-                            if _idx % 3 == 0:
-                                _left_roi = _local_history[_tid].get(_left)
-                                _right_roi = _local_history[_tid].get(_right)
-                                if _left_roi is not None and _right_roi is not None:
-                                    self._draw_path_backfill(cap, _path_frame, _tid, _path_roi,
-                                        _left, _right, _left_roi, _right_roi, resume_frame=frame_no + 1)
-                        for _f, _roi in _local_history.get(_tid, {}).items():
-                            if _roi is not None:
-                                _track_history[_f] = tuple(map(int, _roi))
-                        for _f in range(_left_anchor, _reacquired_frame + 1):
-                            _rois = list(data.get(_f, []))
-                            _roi = _track_history.get(_f)
-                            if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
-                                _rois.append(tuple(map(int, _roi)))
-                            data[_f] = _rois
-                        self._report('reacquisition_backfill_done',
-                            f'立即回溯完成：ID {_tid}，OCR 檢查 {_checked} 次，路徑補遮 {_path_filled.__len__()} 幀。',
-                            _reacquired_frame, track_id=_tid, retro_checked=_checked,
-                            path_filled=len(_path_filled), gap=_gap, immediate_backfill=True)
-                        # Retro OCR seeks backward; restore forward reading position.
+                            cap, _batch_local_history, _batch_start, _batch_end,
+                            frame_w, frame_h, reader, force_check=True)
+                        _all_path_filled = 0
+                        for _tid, _local_history in _batch_local_history.items():
+                            _track_history, _left_anchor, _reacquired_frame, _gap = _batch_meta[_tid]
+                            for _f in range(_left_anchor + 1, _reacquired_frame):
+                                _track_history[_f] = None
+                            for _f, _roi in _local_history.items():
+                                if _roi is not None:
+                                    _track_history[_f] = tuple(map(int, _roi))
+                            _path_filled = self._interpolate_path_gaps(
+                                {_tid: _local_history}, max_gap=self.MAX_PATH_INTERPOLATION_GAP)
+                            _all_path_filled += len(_path_filled)
+                            for _idx, (_path_tid, _path_frame, _path_roi, _left, _right) in enumerate(_path_filled):
+                                if _idx % 3 == 0:
+                                    _left_roi = _local_history.get(_left)
+                                    _right_roi = _local_history.get(_right)
+                                    if _left_roi is not None and _right_roi is not None:
+                                        self._draw_path_backfill(cap, _path_frame, _tid, _path_roi,
+                                            _left, _right, _left_roi, _right_roi, resume_frame=frame_no + 1)
+                            for _f, _roi in _local_history.items():
+                                if _roi is not None:
+                                    _track_history[_f] = tuple(map(int, _roi))
+                            for _f in range(_left_anchor, _reacquired_frame + 1):
+                                data[_f] = [tuple(map(int, _h[_f])) for _h in history.values()
+                                            if _h.get(_f) is not None]
+                            self._report('reacquisition_backfill_done',
+                                f'批次立即回溯完成：ID {_tid}，路徑補遮 {_path_filled.__len__()} 幀。',
+                                _reacquired_frame, track_id=_tid, retro_checked=_checked,
+                                path_filled=len(_path_filled), gap=_gap,
+                                immediate_backfill=True, batch_backfill=True)
+                        self._report('reacquisition_batch_done',
+                            f'多目標重新取得批次回溯完成：{len(_batch_local_history)} 個目標共用 {_checked} 個影格 OCR。',
+                            _batch_end, tracks_checked=len(_batch_local_history),
+                            retro_checked=_checked, path_filled=_all_path_filled,
+                            immediate_backfill=True, batch_backfill=True)
                         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no + 1)
 
                 # Publish live frames regularly, plus every OCR/recovery event.
@@ -1485,32 +1710,27 @@ class OCRTrackingThread(QThread):
                         and self.RETROACTIVE_SEGMENT_INTERVAL > 0
                         and (frame_no - hit_frame + 1) % self.RETROACTIVE_SEGMENT_INTERVAL == 0):
                     segment_start = max(hit_frame, frame_no - self.RETROACTIVE_SEGMENT_INTERVAL + 1 - self.RETRO_OCR_MAX_GAP)
-                    segment_history = {}
-                    for _tid, _track_history in history.items():
-                        segment_history[_tid] = {
-                            _f: _roi for _f, _roi in _track_history.items()
-                            if segment_start <= _f <= frame_no
-                        }
+                    # Only adjacent OCR-confirmed anchors define a valid backfill gap.
+                    # Never fall back to orange/predicted tracker boxes as anchor points.
+                    segment_history = self._pending_anchor_pair_histories(
+                        ocr_history, segment_start, frame_no)
                     self._report('retroactive_check',
                         f'開始分段回溯：F{segment_start} 至 F{frame_no}，檢查最近一段的追蹤缺口。',
                         frame_no, segment_start=segment_start, segment_end=frame_no,
                         retroactive_segment=True)
                     checked_now = self._retroactively_verify_gaps(
-                        cap, segment_history, segment_start, frame_no, frame_w, frame_h, reader)
-                    # Merge only newly OCR-verified boxes back into the full history.
-                    for _tid, _segment_track_history in segment_history.items():
+                        cap, segment_history, segment_start, frame_no, frame_w, frame_h, reader,
+                        force_check=False)
+                    # Merge only the pair's gap into its original ID history.
+                    for _pair_key, _segment_track_history in segment_history.items():
+                        _tid, _left_anchor, _right_anchor = _pair_key
                         _full_history = history.setdefault(_tid, {})
                         for _f, _roi in _segment_track_history.items():
-                            if _roi is not None:
-                                _full_history[_f] = tuple(map(int, _roi))
+                            _full_history[_f] = tuple(map(int, _roi)) if _roi is not None else None
                     # Reflect retroactive detections in the data that will be exported as mosaic.
                     for _f in range(segment_start, frame_no + 1):
-                        _rois = list(data.get(_f, []))
-                        for _track_history in history.values():
-                            _roi = _track_history.get(_f)
-                            if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
-                                _rois.append(tuple(map(int, _roi)))
-                        data[_f] = _rois
+                        data[_f] = [tuple(map(int, _h[_f])) for _h in history.values()
+                                    if _h.get(_f) is not None]
                     self._report('retroactive_segment_done',
                         f'分段回溯結束：本段檢查 {checked_now} 個缺漏影格；已更新馬賽克追蹤資料。',
                         frame_no, retro_checked=checked_now, segment_start=segment_start,
@@ -1551,6 +1771,7 @@ class OCRTrackingThread(QThread):
                         if _roi is None:
                             continue
                         _full_history[_f] = tuple(map(int, _roi))
+                        ocr_history.setdefault(_tid, {})[_f] = tuple(map(int, _roi))
                         _rois = list(data.get(_f, []))
                         if not any(self._iou(_roi, _old) > .985 for _old in _rois):
                             _rois.append(tuple(map(int, _roi)))
@@ -1573,29 +1794,25 @@ class OCRTrackingThread(QThread):
                     and self.RETROACTIVE_SEGMENT_INTERVAL > 0 and frames_in_run > 0
                     and frames_in_run % self.RETROACTIVE_SEGMENT_INTERVAL != 0):
                 segment_start = max(hit_frame, last_frame - self.RETROACTIVE_SEGMENT_INTERVAL + 1 - self.RETRO_OCR_MAX_GAP)
-                segment_history = {
-                    _tid: {_f: _roi for _f, _roi in _track_history.items()
-                           if segment_start <= _f <= last_frame}
-                    for _tid, _track_history in history.items()
-                }
+                # Final pass uses only still-unprocessed OCR-anchor pairs; it does not
+                # repeat gaps already handled during periodic or reacquisition backfill.
+                segment_history = self._pending_anchor_pair_histories(
+                    ocr_history, segment_start, last_frame)
                 self._report('retroactive_check',
                     f'開始最後一段回溯：F{segment_start} 至 F{last_frame}。',
                     last_frame, segment_start=segment_start, segment_end=last_frame,
                     retroactive_segment=True, final_partial_segment=True)
                 checked_now = self._retroactively_verify_gaps(
-                    cap, segment_history, segment_start, last_frame, frame_w, frame_h, reader)
-                for _tid, _segment_track_history in segment_history.items():
+                    cap, segment_history, segment_start, last_frame, frame_w, frame_h, reader,
+                    force_check=False)
+                for _pair_key, _segment_track_history in segment_history.items():
+                    _tid, _left_anchor, _right_anchor = _pair_key
                     _full_history = history.setdefault(_tid, {})
                     for _f, _roi in _segment_track_history.items():
-                        if _roi is not None:
-                            _full_history[_f] = tuple(map(int, _roi))
+                        _full_history[_f] = tuple(map(int, _roi)) if _roi is not None else None
                 for _f in range(segment_start, last_frame + 1):
-                    _rois = list(data.get(_f, []))
-                    for _track_history in history.values():
-                        _roi = _track_history.get(_f)
-                        if _roi is not None and not any(self._iou(_roi, _old) > .985 for _old in _rois):
-                            _rois.append(tuple(map(int, _roi)))
-                    data[_f] = _rois
+                    data[_f] = [tuple(map(int, _h[_f])) for _h in history.values()
+                                if _h.get(_f) is not None]
                 self._report('retroactive_segment_done',
                     f'最後一段回溯完成：檢查 {checked_now} 個缺漏影格。', last_frame,
                     retro_checked=checked_now, segment_start=segment_start,
@@ -1603,7 +1820,7 @@ class OCRTrackingThread(QThread):
 
             # Do not run a second full reverse scan after the whole video ends.
             self._report('retroactive_check',
-                         '分段回溯補查已完成；未啟用整段影片結束後的額外反向掃描。',
+                         '分段回溯補查已完成；僅處理尚未檢查的 OCR 錨點缺口，避免重複回朔。',
                          last_frame, retroactive_mode='per_segment',
                          segment_interval=self.RETROACTIVE_SEGMENT_INTERVAL,
                          end_reverse_check=False, cancelled=self.was_cancelled)
@@ -1629,12 +1846,10 @@ class OCRTrackingThread(QThread):
                     max_path_gap=self.MAX_PATH_INTERPOLATION_GAP,
                     path_mask_expand=self.PATH_MASK_EXPAND)
             for f in range(hit_frame, last_frame+1):
-                rois = list(data.get(f, []))
-                for th in history.values():
-                    roi = th.get(f)
-                    if roi is not None and not any(self._iou(roi, old) > .985 for old in rois):
-                        rois.append(tuple(map(int, roi)))
-                data[f] = rois
+                # Rebuild the export masks from the final corrected history. Do not retain
+                # stale boxes that were produced before retroactive OCR corrected the path.
+                data[f] = [tuple(map(int, th[f])) for th in history.values()
+                           if th.get(f) is not None]
             success = any(bool(v) for v in data.values())
             finish_message = '追蹤已中止；已保留中止前的追蹤資料' if self.was_cancelled else '追蹤完成'
             self._report('finished', finish_message, last_frame, tracked_frames=len(data),

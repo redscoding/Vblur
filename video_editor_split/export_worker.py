@@ -1,5 +1,6 @@
 """Video export worker. Kept separate from OCR/tracking logic."""
 import cv2
+import os
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
@@ -41,32 +42,65 @@ class VideoProcessorThread(QThread):
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            self.finished_signal.emit(""); return
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        source_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        limit_frame = source_total - 1 if self.end_frame is None else min(source_total - 1, self.end_frame)
-        total = max(0, limit_frame + 1)
-        out = cv2.VideoWriter(self.output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        if not out.isOpened():
-            cap.release(); self.finished_signal.emit(""); return
-        current = 0
+            self.finished_signal.emit("")
+            return
+
+        out = None
+        completed = False
         try:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            source_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if width <= 0 or height <= 0 or source_total <= 0:
+                raise RuntimeError("Invalid source video metadata")
+
+            limit_frame = source_total - 1 if self.end_frame is None else min(source_total - 1, self.end_frame)
+            total = max(0, limit_frame + 1)
+            if total <= 0:
+                raise RuntimeError("No frames to export")
+
+            out = cv2.VideoWriter(
+                self.output_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
+            if not out.isOpened():
+                raise RuntimeError("Could not open output writer")
+
+            current = 0
             while current <= limit_frame:
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    # Premature EOF is a failed export, not a successful short video.
+                    raise RuntimeError(f"Source decode stopped at frame {current}/{total}")
+
                 for task in self.mosaic_tasks:
                     if int(task.get("start", 0)) <= current <= int(task.get("end", total - 1)):
                         for roi in self._rois_for_frame(task, current):
                             self._apply_mosaic(frame, roi, task.get("strength", 15))
+
                 out.write(frame)
                 current += 1
-                if current % 15 == 0:
+                if current % 5 == 0 or current == total:
                     self.progress_signal.emit(current, total)
-            self.progress_signal.emit(current, total)
+
+            completed = (current == total)
         except Exception:
-            self.finished_signal.emit(""); return
+            completed = False
         finally:
-            cap.release(); out.release()
-        self.finished_signal.emit(self.output_path)
+            cap.release()
+            if out is not None:
+                out.release()
+
+        if completed and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
+            self.finished_signal.emit(self.output_path)
+        else:
+            # Remove a partial output so it cannot be mistaken for the final result.
+            try:
+                if os.path.exists(self.output_path):
+                    os.remove(self.output_path)
+            except OSError:
+                pass
+            self.finished_signal.emit("")
