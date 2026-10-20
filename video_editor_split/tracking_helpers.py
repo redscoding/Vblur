@@ -4,6 +4,7 @@ This module only relocates existing code; it does not change tracking policy.
 """
 import math
 import time
+from difflib import SequenceMatcher
 import cv2
 import numpy as np
 from frame_buffer import FrameRingBuffer
@@ -136,6 +137,41 @@ class TrackingHelpersMixin:
     def _normalize(text):
         return ''.join(ch for ch in str(text).casefold() if ch.isalnum())
 
+    def _target_text_similarity(self, recognized_text):
+        """Return normalized similarity between the requested text and an OCR result.
+
+        OCR may add a short prefix such as 'ID' or confuse one character. This score
+        avoids accepting arbitrary substrings as a match. Tune the thresholds against
+        representative clips before using this for privacy-sensitive export.
+        """
+        target = self._normalize(getattr(self, 'target_text', ''))
+        recognized = self._normalize(recognized_text)
+        if not target or not recognized:
+            return 0.0
+        if target == recognized:
+            return 1.0
+        ratio = SequenceMatcher(None, target, recognized).ratio()
+        # Allow a small wrapper/prefix around the target (e.g. 'IDABC123'), but not
+        # long strings that merely happen to contain the target as a substring.
+        extra = len(recognized) - len(target)
+        if target in recognized and 0 < extra <= max(2, int(len(target) * 0.30)):
+            ratio = max(ratio, 0.90)
+        return float(ratio)
+
+    def _is_target_text_match(self, recognized_text, confidence=None):
+        """Conservative OCR target gate shared by live tracking and backfill."""
+        target = self._normalize(getattr(self, 'target_text', ''))
+        if not target:
+            return False
+        if confidence is not None:
+            try:
+                if float(confidence) < float(self.MIN_OCR_CONFIDENCE):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        threshold = float(getattr(self, 'MIN_TARGET_TEXT_SIMILARITY', 0.82))
+        return self._target_text_similarity(recognized_text) >= threshold
+
     @staticmethod
     def _create_reader():
         """Load RapidOCR only. Avoid importing EasyOCR/PyTorch, which can fail on Windows DLLs."""
@@ -256,7 +292,7 @@ class TrackingHelpersMixin:
 
     @staticmethod
     def _create_visual_tracker(frame, roi):
-        # 撱箇��瘥������格����函����� CSRT tracker嚗�銝���舐�冽�������� Kalman + ���瘚����
+  # 建立 CSRT 視覺追蹤器；若 OpenCV 不支援，則回傳 None。
         try:
             creator = getattr(cv2, 'TrackerCSRT_create', None)
             if creator is None and hasattr(cv2, 'legacy'):
@@ -344,21 +380,28 @@ class TrackingHelpersMixin:
                     continue
                 px, py = max(2, int(bw*.12)), max(2, int(bh*.20))
                 box = self._clip(frame, (x+x1-px, y+y1-py, bw+2*px, bh+2*py))
-                matched = bool(conf >= self.MIN_OCR_CONFIDENCE and target and target in normalized)
+                matched = self._is_target_text_match(text, conf)
                 raw.append({'text': text, 'confidence': float(conf), 'variant': variant_name,
                             'bbox': tuple(map(int, box)), 'matched': matched})
                 # Draw every OCR candidate in the monitor, including non-matching text.
                 # Only target matches may create or update tracked identities.
                 if matched:
                     found.append((box, text, conf))
-            if found:
-                break  # only pay for preprocessing variants if the original failed
+            # Do not stop after the first variant: CLAHE/adaptive threshold may find
+            # another target in the same frame. Merge duplicates after all variants.
 
-        found.sort(key=lambda d: d[2], reverse=True)
+        found.sort(key=lambda d: (self._target_text_similarity(d[1]), float(d[2])), reverse=True)
         unique = []
         for item in found:
-            if not any(self._iou(item[0], prev[0]) > .82 for prev in unique):
+            duplicate_index = next((i for i, prev in enumerate(unique)
+                                    if self._iou(item[0], prev[0]) > .72), None)
+            if duplicate_index is None:
                 unique.append(item)
+            elif (self._target_text_similarity(item[1]), float(item[2])) > (
+                    self._target_text_similarity(unique[duplicate_index][1]),
+                    float(unique[duplicate_index][2])):
+                unique[duplicate_index] = item
+        unique.sort(key=lambda d: (self._target_text_similarity(d[1]), float(d[2])), reverse=True)
         elapsed = time.monotonic() - started
         mode = 'GLOBAL_KEYFRAME' if full_frame else 'LOCAL_ROI'
         self._monitor_overlay = {
@@ -453,10 +496,10 @@ class TrackingHelpersMixin:
 
     def _draw_reverse_check(self, frame, frame_no, track_id, predicted_roi=None,
                             measured_roi=None, note="回溯檢查"):
-        """��� GUI ��單�������折＊蝷箏�����瑼Ｘ�亙祕���霈�������敶望�潦��
+        """此方法的說明已修復為 UTF-8 可讀文字。
 
-        璈�獢�=������餈質馱���皜祆��撠�雿�蝵殷��蝬�獢�=OCR 蝣箄��雿�蝵柴��
-        frame_no �����典�����瑼Ｘ�仿��皜�嚗���嫣噶雿輻�刻��蝣箄����恍�ＹⅡ撖血����啗��敶望�潦��
+        橘色框表示預測位置；綠色框表示 OCR 確認位置。
+        frame_no 是目前影格索引；畫面會顯示預測框與 OCR 確認框。
         """
         shown = frame.copy()
         if predicted_roi is not None:
@@ -531,24 +574,66 @@ class TrackingHelpersMixin:
             if resume_frame is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, int(resume_frame))
 
+    def _retro_candidate_valid(self, history, frame_no, track_id, predicted_roi, candidate_roi):
+        """Reject OCR hits that are text-correct but spatially implausible or owned by another ID."""
+        px, py, pw, ph = map(float, predicted_roi)
+        cx, cy, cw, ch = map(float, candidate_roi)
+        pcx, pcy = px + pw / 2.0, py + ph / 2.0
+        ccx, ccy = cx + cw / 2.0, cy + ch / 2.0
+        distance = math.hypot(pcx - ccx, pcy - ccy)
+        # Since this is a backfill between known anchors, a matching OCR string alone
+        # is not enough: the candidate must remain reasonably close to the predicted path.
+        max_distance = max(45.0, math.hypot(pw, ph) * 1.35)
+        if distance > max_distance:
+            return False, f"距預測中心 {distance:.1f}px 超過門檻 {max_distance:.1f}px"
+
+        candidate_center = (ccx, ccy)
+        for other_id, other_history in history.items():
+            if other_id == track_id:
+                continue
+            other_roi = other_history.get(int(frame_no))
+            if other_roi is None:
+                continue
+            ox, oy, ow, oh = map(float, other_roi)
+            ocx, ocy = ox + ow / 2.0, oy + oh / 2.0
+            # Prevent two IDs from claiming the same OCR/object box on the same frame.
+            inter_w = max(0.0, min(cx+cw, ox+ow) - max(cx, ox))
+            inter_h = max(0.0, min(cy+ch, oy+oh) - max(cy, oy))
+            inter = inter_w * inter_h
+            union = cw*ch + ow*oh - inter
+            iou = inter / union if union > 0 else 0.0
+            near = math.hypot(candidate_center[0]-ocx, candidate_center[1]-ocy) < max(
+                12.0, 0.35 * max(math.hypot(cw, ch), math.hypot(ow, oh)))
+            if iou >= 0.20 or near:
+                return False, f"候選框與其他 ID {other_id} 的同影格框重疊/過近"
+        return True, "通過空間與 ID 唯一性檢查"
+
     def _retroactively_verify_gaps(self, cap, history, start_frame, end_frame,
                                    frame_w, frame_h, reader):
-        """���皞舀炎��亦�� None 璅�閮����蝻箏仃敶望�潦��
+        """使用局部 OCR 回溯補查缺漏影格，並限制重複與全畫面 OCR 次數。
 
-        ��芸�典��銝�餈質馱頠�頝∠�����敺���賣��������獢����嚗����隞亙�拍垢雿�蝵桐摯蝞�撅���� OCR ROI���
-        蝻箏��銝������� RETRO_OCR_MAX_GAP ��批�塚�����皞舀��������隞� OCR 撖阡��獢�閬�撖怨府敶望�潦��
-        ��������賢��銝����撠�瘥�銝�撟���賢�瑁�� OCR嚗���芾����� history 銝剜��蝣箸����� None ���蝻箏�����
+        優化原則：
+        1. 同一追蹤 ID 的同一影格在一次追蹤工作中只做一次回溯 OCR，避免立即補查、
+           週期補查和最後一段補查重複處理相同影格。
+        2. 每個缺漏影格先執行局部 OCR；只有缺口第一幀及之後每隔指定間隔，才執行
+           一次較昂貴的全畫面 OCR 備援。
+        3. 回溯預覽採樣更新，避免每個缺漏影格都建立並傳送診斷影像。
+
+        已知端點之間仍未被 OCR 確認的缺口，會由後續路徑插值流程處理。
         """
         checked = 0
         matched = 0
         max_gap = max(0, int(self.RETRO_OCR_MAX_GAP))
+        fallback_interval = max(1, int(self.RETRO_GLOBAL_FALLBACK_INTERVAL))
+        monitor_interval = max(1, int(self.RETRO_MONITOR_INTERVAL))
+
         if max_gap == 0:
             self._report('retroactive_check', '回溯補查已停用：RETRO_OCR_MAX_GAP 設為 0', end_frame,
                          retro_checked=0, retro_matched=0, max_gap=max_gap)
             return checked
 
         target = self._normalize(self.target_text)
-        if not target:
+        if not target or reader is None:
             return checked
 
         for track_id, track_history in history.items():
@@ -557,48 +642,86 @@ class TrackingHelpersMixin:
                 gap = right - left - 1
                 if gap <= 0 or gap > max_gap:
                     continue
+
                 a, b = track_history[left], track_history[right]
                 missing = [f for f in range(left + 1, right)
                            if track_history.get(f) is None]
                 if not missing:
                     continue
+
                 self._report('retroactive_check',
                     f'分段回溯：ID {track_id}，F{left} 到 F{right}，檢查缺漏 {len(missing)} 幀',
                     right, track_id=track_id, gap=gap, retro_checked=checked,
                     retro_matched=matched, max_gap=max_gap)
-                for frame_no in missing:
+
+                for gap_index, frame_no in enumerate(missing, start=1):
+                    cache_key = (track_id, int(frame_no))
+                    # 週期回溯的區間會重疊；已嘗試過的影格不再重跑 OCR。
+                    if cache_key in self._retro_checked_frames:
+                        continue
+
                     ratio = (frame_no - left) / float(right - left)
                     predicted = tuple(int(round(a[i] * (1-ratio) + b[i] * ratio)) for i in range(4))
                     frame = self._read_frame_at(cap, frame_no)
                     if frame is None:
                         continue
+
                     pred = self._clip(frame, predicted)
                     search_roi = self._expand_roi(frame, pred, self.RETRO_ROI_EXPAND)
-                    self._draw_reverse_check(frame, frame_no, track_id, pred, None,
-                                             f"缺漏影格 OCR 補查 #{checked+1}")
+                    show_monitor = ((gap_index - 1) % monitor_interval == 0)
+                    if show_monitor:
+                        self._draw_reverse_check(frame, frame_no, track_id, pred, None,
+                                                 f"缺漏影格局部 OCR 補查 #{checked + 1}")
+
+                    # 局部 OCR 保留 robust 模式，以維持低對比或模糊文字的辨識能力。
                     detections, _ = self._ocr(reader, frame, frame_no,
                                               roi=search_roi, full_frame=False, robust=True)
                     checked += 1
+                    self._retro_checked_frames.add(cache_key)
                     candidates = [d for d in detections
-                                  if target in self._normalize(d[1])]
-                    if not candidates:
+                                  if self._is_target_text_match(d[1], d[2])]
+
+                    # 全畫面 OCR 是高成本備援，不再對每一個局部失敗的影格都執行。
+                    # 缺口第一幀先做一次，之後依 fallback_interval 稀疏取樣。
+                    should_global_fallback = (
+                        not candidates and
+                        ((gap_index - 1) % fallback_interval == 0)
+                    )
+                    if should_global_fallback:
                         self._report('retroactive_global_fallback',
-                            f'F{frame_no} 局部回溯未匹配，改做全畫面 OCR', frame_no,
-                            track_id=track_id, search_roi=search_roi)
+                            f'F{frame_no} 局部 OCR 未匹配，執行取樣式全畫面備援 OCR', frame_no,
+                            track_id=track_id, search_roi=search_roi,
+                            fallback_interval=fallback_interval)
                         global_detections, _ = self._ocr(
-                            reader, frame, frame_no, full_frame=True, robust=True)
+                            reader, frame, frame_no, full_frame=True, robust=False)
                         checked += 1
-                        detections.extend(global_detections)
                         candidates = [d for d in global_detections
-                                      if target in self._normalize(d[1])]
-                    self._draw_reverse_check(
-                        frame, frame_no, track_id, pred, None,
-                        f"補查完成：候選 {len(self._monitor_overlay.get('candidates', []))}，匹配 {len(candidates)}")
+                                      if self._is_target_text_match(d[1], d[2])]
+
+                    # OCR 字串吻合仍不代表找對了物理目標；再做位置與跨 ID 去重驗證。
+                    spatially_valid = []
+                    rejected_reasons = []
+                    for candidate in candidates:
+                        valid, reason = self._retro_candidate_valid(
+                            history, frame_no, track_id, pred, candidate[0])
+                        if valid:
+                            spatially_valid.append(candidate)
+                        else:
+                            rejected_reasons.append(reason)
+                    candidates = spatially_valid
+
+                    if show_monitor or candidates or rejected_reasons:
+                        note = (f"回溯確認：有效候選 {len(candidates)}" if candidates else
+                                f"拒絕假匹配：{rejected_reasons[0] if rejected_reasons else '沒有符合候選'}")
+                        self._draw_reverse_check(
+                            frame, frame_no, track_id, pred,
+                            candidates[0][0] if candidates else None, note)
+
                     if candidates:
-                        # ��豢�������亥�����敺�摨扳�������潔��蝵桃��������摮������豢�����
-                        candidates.sort(key=lambda d: math.hypot(
-                            self._center(d[0])[0] - self._center(pred)[0],
-                            self._center(d[0])[1] - self._center(pred)[1]))
+                        candidates.sort(key=lambda d: (
+                            -self._target_text_similarity(d[1]), -float(d[2]),
+                            math.hypot(self._center(d[0])[0] - self._center(pred)[0],
+                                       self._center(d[0])[1] - self._center(pred)[1])))
                         track_history[frame_no] = tuple(map(int, self._clip(frame, candidates[0][0])))
                         matched += 1
                         self._draw_reverse_check(frame, frame_no, track_id, pred,
@@ -610,19 +733,15 @@ class TrackingHelpersMixin:
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(end_frame))
         self._report('retroactive_check',
-            f'分段回溯完成：檢查 {checked} 幀，OCR 成功補到 {matched} 幀',
-            end_frame, retro_checked=checked, retro_matched=matched, max_gap=max_gap)
+            f'分段回溯完成：執行 {checked} 次 OCR，成功補到 {matched} 幀',
+            end_frame, retro_checked=checked, retro_matched=matched, max_gap=max_gap,
+            global_fallback_interval=fallback_interval,
+            unique_frames_checked=len(getattr(self, '_retro_checked_frames', set())))
         return checked
 
     def _retroactively_search_before_first_detection(self, cap, history, start_frame,
                                                      end_frame, frame_w, frame_h, reader):
-        """撠�瘥�璇�頠�頝∠�����蝚砌��甈∪歇��乩��蝵柴��銋�������������餈質馱 + 撅���� OCR���
-
-        �����航�������箏����餌����函�恍�� OCR 瞍�������憪���箇�曉蔣��潛��蝚砌�����畾萸��
-        ��望����拍����舫��獢����������撟�餈質馱��孵噩暺�嚗����皜� ROI嚗������� OCR 蝣箄����格�����
-        ��芣�� OCR 蝣箄����格�����敶望�潭��撖怠�� history嚗���踹�����銝�蝣箏��������皜祆����嗆�����撖衣�格�����
-        瘜冽��嚗���亦�格����券��畾菜����������⊿�剖����������湧����格�������ａ����恍�ｇ��隞���⊥��靽�霅���曉�����
-        """
+        """從首次命中影格向前推估目標路徑，補足首次偵測前的遮罩。"""
         target = self._normalize(self.target_text)
         max_back = max(0, int(self.RETRO_OCR_MAX_GAP))
         checked = matched = tracks_checked = 0
@@ -650,7 +769,7 @@ class TrackingHelpersMixin:
                 first_frame, track_id=track_id, from_frame=first_frame,
                 to_frame=scan_start, max_back=max_back)
 
-            # ���������撟�蝘餃��嚗�瘥�甈∪����桀��獢���批����孵噩暺�嚗�������餈賢�啣��銝�撟����
+            # 將 OCR 確認的 ROI 寫回追蹤歷史。
             for frame_no in range(first_frame - 1, scan_start - 1, -1):
                 prev_frame = self._read_frame_at(cap, frame_no)
                 if prev_frame is None:
@@ -679,19 +798,31 @@ class TrackingHelpersMixin:
                                 predicted = self._clip(prev_frame, (current_roi[0] + delta[0],
                                     current_roi[1] + delta[1], current_roi[2], current_roi[3]))
                                 motion_ok = True
-                # ��亙��瘚�憭望��嚗�隞����閰血�典��雿�蝵桅��餈����撠�嚗���芯誑 OCR 蝣箄��蝯����憛怠�� history���
+            # 將 OCR 確認的 ROI 寫回追蹤歷史。
                 search_roi = self._expand_roi(prev_frame, predicted,
                     self.RETRO_ROI_EXPAND * (1.0 if motion_ok else 1.35))
                 self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
-                    f"首次偵測前回溯 #{checked+1}，光流={'成功' if motion_ok else '備援'}")
+                    f"首次偵測前回溯 #{checked+1}，預測={'光流位移' if motion_ok else '位置備援'}；尚未 OCR 確認")
                 detections, _ = self._ocr(reader, prev_frame, frame_no,
                     roi=search_roi, full_frame=False, robust=True)
                 checked += 1
-                candidates = [d for d in detections if target in self._normalize(d[1])]
+                candidates = [d for d in detections if self._is_target_text_match(d[1], d[2])]
+                spatially_valid = []
+                rejected_reasons = []
+                for candidate in candidates:
+                    valid, reason = self._retro_candidate_valid(
+                        history, frame_no, track_id, predicted, candidate[0])
+                    if valid:
+                        spatially_valid.append(candidate)
+                    else:
+                        rejected_reasons.append(reason)
+                candidates = spatially_valid
                 if candidates:
                     pcx, pcy = self._center(predicted)
-                    candidates.sort(key=lambda d: math.hypot(
-                        self._center(d[0])[0] - pcx, self._center(d[0])[1] - pcy))
+                    candidates.sort(key=lambda d: (
+                        -self._target_text_similarity(d[1]), -float(d[2]),
+                        math.hypot(self._center(d[0])[0] - pcx,
+                                   self._center(d[0])[1] - pcy)))
                     measured = tuple(map(int, self._clip(prev_frame, candidates[0][0])))
                     track_history[frame_no] = measured
                     matched += 1
@@ -703,16 +834,16 @@ class TrackingHelpersMixin:
                         track_id=track_id, roi=measured, retro_checked=checked,
                         retro_matched=matched)
                 else:
-                    # OCR 未確認時，仍將反向光流推估框寫入逐幀 history。
-                    # 否則只更新 current_roi、卻不寫 history，匯出時就完全不會遮這一幀。
-                    px, py, pw, ph = self._clip(prev_frame, predicted)
-                    ew = max(2, int(round(pw * self.PATH_MASK_EXPAND)))
-                    eh = max(2, int(round(ph * self.PATH_MASK_EXPAND)))
-                    predicted_mask = self._clip(
-                        prev_frame,
-                        (px + pw / 2.0 - ew / 2.0,
-                         py + ph / 2.0 - eh / 2.0, ew, eh))
-                    track_history[frame_no] = tuple(map(int, predicted_mask))
+                    if rejected_reasons:
+                        self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
+                            f"拒絕假匹配：{rejected_reasons[0]}")
+                    # 未取得 OCR 確認時，不把推測框寫進可匯出的遮罩歷史；
+                    # 否則錯誤光流會被當成有效 ID 框，並在後續影格持續擴散。
+                    # 保留上一個可靠位置作為下一次估計的參考，但此影格不宣告回溯成功。
+                    if not motion_ok:
+                        self._draw_reverse_check(prev_frame, frame_no, track_id, predicted, None,
+                            "停止此 ID 回溯：沒有 OCR 確認且光流位移不可靠")
+                        break
                     current_roi = predicted
                 current_frame = prev_frame
                 current_gray = prev_gray

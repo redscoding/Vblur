@@ -653,17 +653,38 @@ class ProVideoEditor(QMainWindow):
         self.lbl_status.setText(msg)
 
     def on_ocr_finished(self, tracking_data, last_frame, success):
+        """追蹤正常完成時保留原流程；使用者取消時，自動匯出已處理的部分影片。"""
         if self.progress_dialog:
             self.progress_dialog.close()
+            self.progress_dialog = None
         self.btn_ocr.setEnabled(bool(self.video_path))
-        if not success or not tracking_data:
-            QMessageBox.warning(self, "追蹤未完成", "沒有取得可用的追蹤資料。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。")
+
+        was_cancelled = bool(
+            self.ocr_thread and getattr(self.ocr_thread, "was_cancelled", False)
+        )
+        # 即使 success=False，只要中止前留下有效 ROI，也允許輸出部分結果。
+        has_usable_data = bool(tracking_data) and any(
+            value is not None and value != [] and value != ()
+            for value in tracking_data.values()
+        )
+
+        if not has_usable_data or (not success and not was_cancelled):
+            QMessageBox.warning(
+                self, "追蹤未完成",
+                "沒有取得可用的追蹤資料。請查看「AI OCR 即時監控」中的結束原因與錯誤紀錄。"
+            )
             self.lbl_status.setText("Status: OCR tracking failed")
+            if self.monitor_dialog:
+                self.monitor_dialog.raise_()
+                self.monitor_dialog.activateWindow()
             return
+
+        task_start = min(tracking_data.keys())
+        task_end = max(task_start, int(last_frame))
         task = {
             "type": "tracking",
-            "start": min(tracking_data.keys()),
-            "end": last_frame,
+            "start": task_start,
+            "end": task_end,
             "tracking_data": tracking_data,
             "strength": 15,
         }
@@ -671,11 +692,83 @@ class ProVideoEditor(QMainWindow):
         self.update_task_list_display()
         self.list_tasks.setCurrentRow(len(self.mosaic_tasks) - 1)
         self.refresh_display()
-        max_targets = max((len(v) if isinstance(v, (list, tuple)) and not (len(v) == 4 and all(isinstance(x, (int, float)) for x in v)) else (1 if v else 0) for v in tracking_data.values()), default=0)
-        self.lbl_status.setText(f"Status: 多目標追蹤完成，最多同時 {max_targets} 個框；最後影格 F{last_frame}")
+
+        max_targets = max((
+            len(v) if isinstance(v, (list, tuple))
+            and not (len(v) == 4 and all(isinstance(x, (int, float)) for x in v))
+            else (1 if v else 0)
+        ) for v in tracking_data.values()) if tracking_data else 0
+
+        if was_cancelled:
+            self.lbl_status.setText(
+                f"Status: 追蹤已中止；已保留 F{task_start} 至 F{task_end}，準備匯出部分影片"
+            )
+        else:
+            self.lbl_status.setText(
+                f"Status: 多目標追蹤完成，最多同時 {max_targets} 個框；最後影格 F{task_end}"
+            )
+
         if self.monitor_dialog:
             self.monitor_dialog.raise_()
             self.monitor_dialog.activateWindow()
+
+        if was_cancelled:
+            self._prompt_and_export_partial(task_end)
+
+    def _prompt_and_export_partial(self, end_frame):
+        """中止後詢問輸出位置，將來源影片第 0 幀至 end_frame 匯出。"""
+        if not self.video_path or not self.mosaic_tasks:
+            return
+        source_stem = os.path.splitext(os.path.basename(self.video_path))[0]
+        default_path = os.path.join(
+            os.path.dirname(self.video_path), f"{source_stem}_partial_mosaic.mp4"
+        )
+        output, _ = QFileDialog.getSaveFileName(
+            self, "儲存已中止追蹤的部分影片", default_path, "MP4 Video (*.mp4)"
+        )
+        if not output:
+            self.lbl_status.setText(
+                f"Status: 追蹤資料已保留到 F{end_frame}；可稍後按「匯出影片」手動輸出"
+            )
+            QMessageBox.information(
+                self, "已保留追蹤資料",
+                "你取消了儲存視窗。追蹤資料仍保留在段落清單中；需要輸出時可再按「Export Video」。"
+            )
+            return
+        if not output.lower().endswith(".mp4"):
+            output += ".mp4"
+        self._start_export(output, end_frame=end_frame, partial=True)
+
+    def _start_export(self, output, end_frame=None, partial=False):
+        """啟動匯出；部分影片模式會只輸出到指定影格。"""
+        if not output:
+            return
+        self.btn_export.setEnabled(False)
+        self.export_end_frame = end_frame
+        self.export_is_partial = bool(partial)
+        try:
+            # 新版 export_worker.py 的 VideoProcessorThread 支援 end_frame。
+            self.worker = VideoProcessorThread(
+                self.video_path, output, list(self.mosaic_tasks), end_frame=end_frame
+            )
+        except TypeError:
+            # 舊版匯出器沒有 end_frame 參數時，維持相容，但會匯出完整來源影片。
+            self.worker = VideoProcessorThread(
+                self.video_path, output, list(self.mosaic_tasks)
+            )
+            if partial:
+                QMessageBox.warning(
+                    self, "匯出器版本提醒",
+                    "目前的 export_worker.py 不支援 end_frame，因此會匯出整段來源影片。\n"
+                    "若要只輸出中止前的部分影片，請使用支援 end_frame 參數的 export_worker.py。"
+                )
+        self.worker.progress_signal.connect(
+            lambda current, total: self.lbl_status.setText(
+                f"正在匯出{'部分' if partial else ''}影片：{current}/{total} frames"
+            )
+        )
+        self.worker.finished_signal.connect(self.export_finished)
+        self.worker.start()
 
     def add_new_task(self):
         if not self.cap or self.current_raw_frame is None:
@@ -767,20 +860,27 @@ class ProVideoEditor(QMainWindow):
             return
         if not output.lower().endswith(".mp4"):
             output += ".mp4"
-        self.btn_export.setEnabled(False)
-        self.worker = VideoProcessorThread(self.video_path, output, list(self.mosaic_tasks))
-        self.worker.progress_signal.connect(lambda current, total: self.lbl_status.setText(f"Exporting: {current}/{total} frames"))
-        self.worker.finished_signal.connect(self.export_finished)
-        self.worker.start()
+        self._start_export(output, end_frame=None, partial=False)
 
     def export_finished(self, path):
         self.btn_export.setEnabled(True)
         if not path:
             self.lbl_status.setText("Status: Export failed")
-            QMessageBox.warning(self, "匯出失敗", "無法建立輸出影片。請確認影片編碼器與輸出路徑。")
+            QMessageBox.warning(
+                self, "匯出失敗",
+                "無法建立輸出影片。請確認影片編碼器與輸出路徑，並確認磁碟空間足夠。"
+            )
             return
-        self.lbl_status.setText("Status: Ready")
-        QMessageBox.information(self, "Success", f"影片已成功輸出！\n{path}")
+        if getattr(self, "export_is_partial", False):
+            end_frame = getattr(self, "export_end_frame", None)
+            self.lbl_status.setText(f"Status: 部分影片匯出完成（截至 F{end_frame}）")
+            QMessageBox.information(
+                self, "部分影片已輸出",
+                f"已成功輸出中止前的部分影片（截至影格 F{end_frame}）：\n{path}"
+            )
+        else:
+            self.lbl_status.setText("Status: Ready")
+            QMessageBox.information(self, "Success", f"影片已成功輸出！\n{path}")
 
     def closeEvent(self, event):
         if self.ocr_thread and self.ocr_thread.isRunning():
