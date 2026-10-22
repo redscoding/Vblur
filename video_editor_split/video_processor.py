@@ -108,12 +108,12 @@ class OCRTrackingThread(QThread):
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
     GLOBAL_OCR_INTERVAL = 5           # 快速位移時更頻繁全畫面 OCR，降低錯過新位置的時間。
-    LOCAL_RECOVERY_INTERVAL = 3       # 追蹤遺失時約每 3 幀重試一次局部 OCR，不採用長時間指數退避
+    LOCAL_RECOVERY_INTERVAL = 2       # 追蹤遺失時每 2 幀重試局部 OCR，縮短重新定位延遲
     MAX_OCR_ROI_DIM = 800             # 局部 OCR 搜尋區域的最大尺寸。
     MAX_GLOBAL_OCR_DIM = 1280         # 全畫面 OCR 的縮放尺寸上限。
     MIN_FEATURE_POINTS = 4
     MAX_LOST_FRAMES = 3  # 保留舊版相容設定；實際遮罩恢復另由狀態控制。
-    CONSERVATIVE_MASK_FRAMES = 10  # 短暫追蹤遺失時，暫時使用預測框保守遮罩。
+    CONSERVATIVE_MASK_FRAMES = 3  # 只短暫使用預測框；失去追蹤後不長時間遮住錯誤位置。
     RECOVERY_SCALE = 3.0
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
@@ -125,6 +125,11 @@ class OCRTrackingThread(QThread):
     # 自適應框穩定：小幅抖動時加強平滑，大幅移動時提高反應速度。
     STABLE_CENTER_DEADBAND_RATIO = 0.012
     STABLE_SIZE_DEADBAND_RATIO = 0.04
+    # 通用尺寸先驗，不針對特定影片/物件。以使用者初始框和近期可信框共同估計尺寸。
+    SIZE_PRIOR_MIN_SCALE = 0.50
+    SIZE_PRIOR_MAX_SCALE = 2.00
+    SIZE_JUMP_LIMIT = 1.80
+    SIZE_HISTORY_LENGTH = 9
     IMMEDIATE_RETRACE_ON_REACQUISITION = True  # 重新找到目標時，立即回頭檢查剛才的缺口
     RETRO_OCR_MAX_GAP = 120  # 回溯 OCR 檢查的最大缺口幀數。
     RETRO_ROI_EXPAND = 2.2  # 回溯時擴大局部搜尋範圍。
@@ -368,6 +373,13 @@ class OCRTrackingThread(QThread):
                 'kalman': SortMotionModel(roi), 'points': self._features(gray, roi),
                 'visual_tracker': self._create_visual_tracker(frame, roi),
                 'appearance': appearance, 'anchor_appearance': appearance, 'lost': 0,
+                # The user-selected box is a size prior, not a permanently fixed box.
+                # Trusted observations may adapt it gradually as perspective/distance changes.
+                'initial_roi': tuple(map(int, roi)),
+                'size_reference': (float(roi[2]), float(roi[3])),
+                'size_history': [(float(roi[2]), float(roi[3]))],
+                'ocr_size_reference_ready': False,
+                'size_rejections': 0,
                 'speed': 0.0, 'text': text, 'confidence': float(confidence),
                 'state': 'MANUAL_INIT' if self.initial_roi is not None else 'OCR_CONFIRMED',
                 'last_seen_frame': int(frame_no), 'last_ocr_frame': int(frame_no),
@@ -382,14 +394,15 @@ class OCRTrackingThread(QThread):
         return OCRTrackingThread._clip(frame, (cx - nw/2, cy - nh/2, nw, nh))
 
     def _stabilize_roi(self, frame, track, measured_roi, source="visual", confidence=0.5):
-        """平滑框的位置與尺寸；依移動量調整，不將單一場景寫死。
+        """Stabilize position and size using the user's initial ROI plus trusted history.
 
-        小幅位移通常是追蹤器抖動，因此使用較低更新率；明顯移動時提高更新率，
-        避免平滑造成拖影。重新找回目標時信任新量測，避免被舊位置拉回。
+        The initial dimensions are a prior, not a hard-coded output size. The accepted
+        size history lets the box adapt gradually when the target genuinely changes scale,
+        while rejecting abrupt tracker/OCR boxes that are likely to include neighbours.
         """
         measured = tuple(map(int, self._clip(frame, measured_roi)))
         previous = track.get("roi")
-        if previous is None or int(track.get("lost", 0)) > 0:
+        if previous is None:
             return measured
 
         px, py, pw, ph = [float(v) for v in previous]
@@ -397,48 +410,89 @@ class OCRTrackingThread(QThread):
         if min(pw, ph, mw, mh) <= 1:
             return measured
 
+        # Build a robust size reference from the user selection and recent accepted boxes.
+        # Median is resistant to one oversized detection in a dense scene.
+        initial_w, initial_h = track.get('size_reference', (pw, ph))
+        # The first OCR-confirmed box calibrates the text/target geometry. This matters
+        # when the user's initial ROI contains a little context around the text itself.
+        # Subsequent OCR boxes are checked against this learned baseline and recent history.
+        if source == 'ocr' and not track.get('ocr_size_reference_ready', False):
+            initial_w, initial_h = float(mw), float(mh)
+            track['size_reference'] = (initial_w, initial_h)
+            track['size_history'] = [(initial_w, initial_h)]
+            track['ocr_size_reference_ready'] = True
+        samples = track.setdefault('size_history', [(initial_w, initial_h)])
+        valid_samples = [(float(w), float(h)) for w, h in samples if w > 1 and h > 1]
+        if not valid_samples:
+            valid_samples = [(float(initial_w), float(initial_h))]
+        recent = valid_samples[-self.SIZE_HISTORY_LENGTH:]
+        median_w = float(np.median([item[0] for item in recent]))
+        median_h = float(np.median([item[1] for item in recent]))
+
+        # Combine the initial selection with the recent median. As history grows, the
+        # recent measurements can adapt the reference without forgetting initialization.
+        history_weight = min(0.75, len(recent) / float(self.SIZE_HISTORY_LENGTH + 1))
+        ref_w = (1.0 - history_weight) * float(initial_w) + history_weight * median_w
+        ref_h = (1.0 - history_weight) * float(initial_h) + history_weight * median_h
+        ref_w, ref_h = max(2.0, ref_w), max(2.0, ref_h)
+
+        # Treat a large one-frame size jump as unreliable. Instead of freezing the whole
+        # box, retain the new center but use a plausible size based on the current reference.
+        min_w = max(2.0, ref_w * self.SIZE_PRIOR_MIN_SCALE)
+        max_w = max(min_w, ref_w * self.SIZE_PRIOR_MAX_SCALE)
+        min_h = max(2.0, ref_h * self.SIZE_PRIOR_MIN_SCALE)
+        max_h = max(min_h, ref_h * self.SIZE_PRIOR_MAX_SCALE)
+        candidate_w = float(np.clip(mw, min_w, max_w))
+        candidate_h = float(np.clip(mh, min_h, max_h))
+        size_jump = max(candidate_w / max(1.0, pw), pw / max(1.0, candidate_w),
+                        candidate_h / max(1.0, ph), ph / max(1.0, candidate_h))
+        if size_jump > self.SIZE_JUMP_LIMIT:
+            # Keep the previous dimensions for this measurement; still follow its center.
+            candidate_w, candidate_h = pw, ph
+            track['size_rejections'] = int(track.get('size_rejections', 0)) + 1
+        else:
+            track['size_history'].append((candidate_w, candidate_h))
+            del track['size_history'][:-self.SIZE_HISTORY_LENGTH]
+
         pcx, pcy = px + pw / 2.0, py + ph / 2.0
         mcx, mcy = mx + mw / 2.0, my + mh / 2.0
         diagonal = max(20.0, math.hypot(pw, ph))
         displacement = math.hypot(mcx - pcx, mcy - pcy)
         relative_motion = displacement / diagonal
-
-        # 低於目標尺寸比例的微小位移視為抖動；移動越明顯，越快跟上量測。
         if relative_motion <= self.STABLE_CENTER_DEADBAND_RATIO:
             center_alpha = 0.18
         else:
-            center_alpha = float(np.clip(
-                0.22 + (relative_motion - self.STABLE_CENTER_DEADBAND_RATIO) * 2.0,
-                0.22, 0.88))
-        if relative_motion >= 0.35:
-            center_alpha = max(center_alpha, 0.88)
+            overshoot = relative_motion - self.STABLE_CENTER_DEADBAND_RATIO
+            center_alpha = 1.0 - 0.82 * math.exp(-4.5 * overshoot)
         if source == "ocr":
-            # OCR 的框中心通常較可靠，但也可能因文字框邊界而輕微跳動。
-            center_alpha = min(0.78, center_alpha + 0.08 * float(np.clip(confidence, 0.0, 1.0)))
+            center_alpha = min(1.0, center_alpha + 0.15 * float(np.clip(confidence, 0.0, 1.0)))
 
-        # 將尺寸與中心分開處理，避免 OCR/CSRT 一幀的框寬高變化直接造成馬賽克忽大忽小。
-        rel_w = abs(mw - pw) / max(1.0, pw)
-        rel_h = abs(mh - ph) / max(1.0, ph)
-        relative_size_change = max(rel_w, rel_h)
+        relative_size_change = max(
+            abs(candidate_w - pw) / max(1.0, pw),
+            abs(candidate_h - ph) / max(1.0, ph))
         if relative_size_change <= self.STABLE_SIZE_DEADBAND_RATIO:
             size_alpha = 0.16
-        elif relative_size_change <= 0.12:
-            size_alpha = 0.22 + (relative_size_change - self.STABLE_SIZE_DEADBAND_RATIO) * 1.2
-        elif relative_size_change <= 0.28:
-            size_alpha = 0.32 + (relative_size_change - 0.12) * 1.0
         else:
-            # 大幅尺寸變化仍可跟隨，但不讓單一框突然完全改變輸出尺寸。
-            size_alpha = 0.48
+            overshoot = relative_size_change - self.STABLE_SIZE_DEADBAND_RATIO
+            size_alpha = 1.0 - 0.84 * math.exp(-3.5 * overshoot)
         if source == "ocr":
-            size_alpha = min(0.68, size_alpha + 0.12 * float(np.clip(confidence, 0.0, 1.0)))
-        size_alpha = float(np.clip(size_alpha, 0.16, 0.68))
+            size_alpha = min(1.0, size_alpha + 0.15 * float(np.clip(confidence, 0.0, 1.0)))
 
         cx = pcx + center_alpha * (mcx - pcx)
         cy = pcy + center_alpha * (mcy - pcy)
-        width = max(2.0, pw + size_alpha * (mw - pw))
-        height = max(2.0, ph + size_alpha * (mh - ph))
+        width = max(2.0, pw + size_alpha * (candidate_w - pw))
+        height = max(2.0, ph + size_alpha * (candidate_h - ph))
         stabilized = (cx - width / 2.0, cy - height / 2.0, width, height)
-        return tuple(map(int, self._clip(frame, stabilized)))
+        result = tuple(map(int, self._clip(frame, stabilized)))
+        track['last_size_diagnostics'] = {
+            'source': source,
+            'initial_size': (int(initial_w), int(initial_h)),
+            'reference_size': (round(ref_w, 2), round(ref_h, 2)),
+            'measured_size': (int(mw), int(mh)),
+            'accepted_size': (int(result[2]), int(result[3])),
+            'size_rejections': int(track.get('size_rejections', 0)),
+        }
+        return result
 
     def _ocr(self, reader, frame, frame_no, roi=None, full_frame=False, robust=False):
         """OCR a local ROI, or a downscaled full frame on sparse recovery keyframes only."""
@@ -460,9 +514,19 @@ class OCRTrackingThread(QThread):
 
         # Keep small text at native size; downscale only oversized inputs.
         ch, cw = crop.shape[:2]
-        scale = min(1.0, max_dim / float(max(ch, cw)))
-        ocr_crop = crop if scale >= 1.0 else cv2.resize(
-            crop, (max(1, int(cw*scale)), max(1, int(ch*scale))), interpolation=cv2.INTER_AREA)
+        if full_frame:
+            scale = min(1.0, max_dim / float(max(ch, cw)))
+        else:
+            # 針對局部 OCR，如果太小則強制放大以利於密集微小字體辨識
+            target_h = max(36.0, float(ch))
+            scale = min(max_dim / float(max(ch, cw)), target_h / float(max(1, ch)))
+            
+        if scale == 1.0:
+            ocr_crop = crop
+        else:
+            interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+            ocr_crop = cv2.resize(crop, (max(1, int(cw * scale)), max(1, int(ch * scale))), interpolation=interp)
+            
         target = self._normalize(self.target_text)
         found, raw = [], []
         gray = cv2.cvtColor(ocr_crop, cv2.COLOR_BGR2GRAY) if ocr_crop.ndim == 3 else ocr_crop
@@ -491,7 +555,9 @@ class OCRTrackingThread(QThread):
                 bw, bh = x2-x1, y2-y1
                 if bw <= 0 or bh <= 0:
                     continue
-                px, py = max(2, int(bw*.12)), max(2, int(bh*.20))
+                # Small proportional OCR margin: scales with the detected text rather than
+                # using a large fixed expansion that merges neighbouring targets in dense scenes.
+                px, py = max(1, int(round(bw * 0.04))), max(1, int(round(bh * 0.08)))
                 box = self._clip(frame, (x+x1-px, y+y1-py, bw+2*px, bh+2*py))
                 matched = bool(conf >= self.MIN_OCR_CONFIDENCE and target and target in normalized)
                 raw.append({'text': text, 'confidence': float(conf), 'variant': variant_name,
@@ -527,32 +593,38 @@ class OCRTrackingThread(QThread):
                   'TRACKING': (255, 210, 0), 'FAST_MOTION': (255, 0, 255),
                   'RECOVERY': (0, 190, 255), 'LOST': (0, 0, 255)}
         for tid, track in tracks.items():
-            # Hide stale visualization after three consecutive lost frames; keep the
-            # internal track state so local OCR may still recover it later.
-            if int(track.get('lost', 0)) > self.CONSERVATIVE_MASK_FRAMES:
-                continue
-            roi = track.get('roi', (0, 0, 1, 1))
-            x, y, w, h = roi
+            lost = int(track.get('lost', 0))
             state = track.get('state', 'TRACKING')
+            roi = track.get('roi', (0, 0, 1, 1))
+            x, y, w, h = map(int, roi)
             color = colors.get(state, (255, 255, 255))
-            cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
-            # Dashed-style predicted box shows where motion model expects the target.
-            predicted_roi = track.get('predicted_roi')
-            if predicted_roi is not None and (track.get('lost', 0) > 0 or state in ('RECOVERY', 'LOST')):
-                px, py, pw, ph = map(int, self._clip(frame, predicted_roi))
-                for xx in range(px, px+pw, 14):
-                    cv2.line(shown, (xx, py), (min(xx+7, px+pw), py), (0, 165, 255), 2)
-                    cv2.line(shown, (xx, py+ph), (min(xx+7, px+pw), py+ph), (0, 165, 255), 2)
-                for yy in range(py, py+ph, 14):
-                    cv2.line(shown, (px, yy), (px, min(yy+7, py+ph)), (0, 165, 255), 2)
-                    cv2.line(shown, (px+pw, yy), (px+pw, min(yy+7, py+ph)), (0, 165, 255), 2)
-            reason = track.get('loss_reason', '')
-            recovery_note = str(track.get('recovery_note', ''))
-            label = f'ID {tid} {state} v={track.get("speed", 0):.1f}' + (f' [{reason}]' if reason else '')
-            if recovery_note and int(track.get('lost', 0)) > 0:
-                label += ' | ' + recovery_note[:32]
-            cv2.putText(shown, label, (x, max(18, y-5)), cv2.FONT_HERSHEY_SIMPLEX,
-                        .48, color, 2, cv2.LINE_AA)
+
+            # A visual tracker result is not trusted once the track is lost.
+            # Show only a short-lived dashed prediction, never a solid blue/stale box.
+            if lost == 0:
+                cv2.rectangle(shown, (x, y), (x+w, y+h), color, 2)
+                label = f'ID {tid} {state} v={track.get("speed", 0):.1f}'
+                cv2.putText(shown, label, (x, max(18, y-5)), cv2.FONT_HERSHEY_SIMPLEX,
+                            .48, color, 2, cv2.LINE_AA)
+                continue
+
+            # Keep the target ID internally for OCR recovery, but stop drawing a box
+            # at an unverified location after the short prediction grace period.
+            if lost <= 2:
+                predicted_roi = track.get('predicted_roi')
+                if predicted_roi is not None:
+                    px, py, pw, ph = map(int, self._clip(frame, predicted_roi))
+                    dash = 8
+                    for xx in range(px, px+pw, dash*2):
+                        cv2.line(shown, (xx, py), (min(xx+dash, px+pw), py), (0, 165, 255), 2)
+                        cv2.line(shown, (xx, py+ph), (min(xx+dash, px+pw), py+ph), (0, 165, 255), 2)
+                    for yy in range(py, py+ph, dash*2):
+                        cv2.line(shown, (px, yy), (px, min(yy+dash, py+ph)), (0, 165, 255), 2)
+                        cv2.line(shown, (px+pw, yy), (px+pw, min(yy+dash, py+ph)), (0, 165, 255), 2)
+                    cv2.putText(shown, f'ID {tid} SEARCHING', (px, max(18, py-5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, .46, (0, 165, 255), 2, cv2.LINE_AA)
+            # For lost > 2, intentionally draw no object box. The ID remains available
+            # to local/global OCR recovery, but the monitor does not imply a false lock.
         overlay = getattr(self, '_monitor_overlay', {})
         # Visualize OCR search ROI only on the exact frame where OCR ran, avoiding stale boxes.
         if overlay.get('frame') == int(frame_no):
@@ -592,7 +664,7 @@ class OCRTrackingThread(QThread):
         # Fixed legend makes it easier to distinguish real OCR results from predictions.
         legend_y = max(18, shown.shape[0] - 12)
         cv2.rectangle(shown, (0, max(0, legend_y - 22)), (shown.shape[1], shown.shape[0]), (18, 18, 18), -1)
-        cv2.putText(shown, 'GREEN=OCR MATCH  RED=OTHER OCR  ORANGE=SEARCH/PREDICTION  BLUE=TRACK',
+        cv2.putText(shown, 'GREEN=OCR MATCH  RED=OTHER OCR  ORANGE=SHORT PREDICTION  BLUE=VERIFIED TRACK',
                     (10, legend_y), cv2.FONT_HERSHEY_SIMPLEX, .43, (245, 245, 245), 1, cv2.LINE_AA)
         mh, mw = shown.shape[:2]
         monitor_scale = min(1.0, 960.0 / max(mh, mw))
@@ -850,7 +922,7 @@ class OCRTrackingThread(QThread):
                             pcx, pcy = center(prev['roi'])
                             ccx, ccy = center(cand['roi'])
                             displacement = math.hypot(ccx-pcx, ccy-pcy) / frame_diag
-                            # 飽和型位移成本：大幅移動增加成本，但不會被硬門檻淘汰。
+                            # 飽滿型位移成本：大幅移動增加成本，但不會被硬門檻淘汰。
                             transition = 0.72 * min(2.0, displacement * 5.0 / max(1.0, math.sqrt(dt)))
                             transition += 0.12 * min(3.0, box_size_cost(cand['roi'], prev['roi']))
                             # 用上一段速度做柔性加速度懲罰；只在已有前一個移動狀態時生效。
@@ -1134,8 +1206,11 @@ class OCRTrackingThread(QThread):
                     y = a[1] * (1-ratio) + b[1] * ratio
                     w = a[2] * (1-ratio) + b[2] * ratio
                     h = a[3] * (1-ratio) + b[3] * ratio
-                    # Keep the interpolated center, but add a small privacy margin.
-                    ew, eh = w * expand, h * expand
+                    # Longer gaps imply more position uncertainty, so use a gap-dependent
+                    # privacy margin instead of expanding every interpolated box equally.
+                    gap_uncertainty = min(0.20, 0.20 * gap / float(max(1, max_gap)))
+                    adaptive_expand = max(1.0, expand + gap_uncertainty)
+                    ew, eh = w * adaptive_expand, h * adaptive_expand
                     track_history[frame_no] = (int(round(x + w/2 - ew/2)),
                                                int(round(y + h/2 - eh/2)),
                                                max(2, int(round(ew))), max(2, int(round(eh))))
@@ -1315,15 +1390,17 @@ class OCRTrackingThread(QThread):
                     pred_distance = math.hypot(new_c[0]-pred_c[0], new_c[1]-pred_c[1])
                     # Repeated identical objects can attract CSRT/KLT to the wrong instance.
                     # Gate candidates against the motion prediction, not only the previous box.
-                    prediction_gate = max(32.0, diag * 1.25,
-                                          float(track['speed']) * 2.5 + diag * 0.5)
+                    # 針對密集小字優化：縮小預測容忍度，避免 CSRT/KLT 鎖死在相鄰的靜止干擾物上
+                    prediction_gate = max(18.0, diag * 1.1, float(track['speed']) * 2.0 + diag * 0.4)
                     if flow_ok and pred_distance > prediction_gate:
                         flow_ok = False
                         track['loss_reason'] = 'prediction_gate_rejected_possible_identity_switch'
                     # 根據外觀、位移與影格品質驗證候選框。
                     anchor = track.get('anchor_appearance')
+                    previous_appearance = track.get('appearance')
                     candidate_appearance = self._appearance(frame, candidate) if flow_ok else None
                     anchor_score = self._appearance_score(anchor, candidate_appearance)
+                    recent_appearance_score = self._appearance_score(previous_appearance, candidate_appearance)
                     blur_score = self._blur_score(frame, candidate)
                     diag_info = {
                         'fps': source_fps, 'target_displacement_px_frame': round(move, 2),
@@ -1335,27 +1412,44 @@ class OCRTrackingThread(QThread):
                         'csrt_flow_disagreement_px': round(csrt_flow_delta, 2) if csrt_flow_delta is not None else None,
                         'blur_laplacian_variance': round(blur_score, 2),
                         'appearance_score': round(anchor_score, 3),
+                        'recent_appearance_score': round(recent_appearance_score, 3),
                     }
                     track['last_diagnostics'] = diag_info
-                    if flow_ok and anchor is not None and anchor_score < 0.24:
+                    # Repetitive neighbouring text can look trackable to CSRT. Require
+                    # agreement with both the initial appearance and the most recent trusted
+                    # crop; CSRT-only updates get a stricter threshold than corroborated flow.
+                    if flow_ok and anchor is not None and anchor_score < 0.28:
                         flow_ok = False
-                        track['loss_reason'] = 'appearance_mismatch'
+                        track['loss_reason'] = 'anchor_appearance_mismatch'
+                    if flow_ok and previous_appearance is not None:
+                        recent_gate = 0.34 if csrt_ok and flow_count < self.MIN_FEATURE_POINTS else 0.25
+                        if recent_appearance_score < recent_gate:
+                            flow_ok = False
+                            track['loss_reason'] = 'recent_appearance_mismatch'
                     if flow_ok and move > max_move:
+                        flow_ok = False
                         track['loss_reason'] = 'large_displacement_gate'
                     if not csrt_ok and flow_count < self.MIN_FEATURE_POINTS:
+                        flow_ok = False
                         track['loss_reason'] = 'few_features_or_motion_blur'
                     if csrt_flow_delta is not None and csrt_flow_delta > max(25.0, diag * 0.5):
+                        flow_ok = False
                         track['loss_reason'] = 'tracker_disagreement'
                     if camera_moving and move < global_motion * 0.35:
+                        flow_ok = False
                         track['loss_reason'] = 'possible_camera_motion'
                     if source_fps and source_fps < 20.0 and move > diag * 0.8 and (flow_count < 8 or not csrt_ok):
+                        flow_ok = False
                         track['loss_reason'] = 'low_source_fps_plus_fast_motion'
                     elif move > diag * 0.8 and (flow_count < 8 or not csrt_ok):
+                        flow_ok = False
                         track['loss_reason'] = 'possible_fast_target_motion'
                     rx, ry, rw, rh = candidate
                     if rx <= 1 or ry <= 1 or rx + rw >= frame_w - 1 or ry + rh >= frame_h - 1:
+                        flow_ok = False
                         track['loss_reason'] = 'roi_near_frame_edge_or_target_leaving_view'
                     if blur_score < 35.0 and not csrt_ok:
+                        flow_ok = False
                         track['loss_reason'] = 'possible_motion_blur_or_low_texture'
                     if flow_ok and move <= max_move:
                         stable_candidate = self._stabilize_roi(frame, track, candidate, source='visual')
@@ -1411,7 +1505,7 @@ class OCRTrackingThread(QThread):
                         recovery_due.append(tid)
 
                 if reader is not None:
-                    # Full-frame OCR only at sparse keyframes (default every 15 frames),
+                    # Full-frame OCR only at sparse keyframes (default every 5 frames),
                     # resized to at most 960 px. This is necessary to find a target that
                     # appears outside the selected object's local search area.
                     if should_global_ocr:
@@ -1454,8 +1548,9 @@ class OCRTrackingThread(QThread):
                             track['recovery_attempts'] = int(track.get('recovery_attempts', 0)) + 1
                             attempts = int(track['recovery_attempts'])
                             # Expand local search progressively as the target may have moved
-                            # farther than the motion model predicted.
-                            scale = min(self.RECOVERY_SCALE * (1.0 + 0.45 * max(0, attempts - 1)), 8.0)
+                            # farther than the motion model predicted.限制膨脹比例避免鄰居干擾。
+                            base_scale = self.RECOVERY_SCALE * (1.0 + 0.35 * max(0, attempts - 1))
+                            scale = min(base_scale, 4.5)
                             local_roi = self._expand_roi(frame, pred, scale)
                             robust_ocr = attempts >= 2
                             local, _ = self._ocr(reader, frame, frame_no, roi=local_roi, robust=robust_ocr)
@@ -1469,7 +1564,7 @@ class OCRTrackingThread(QThread):
                             # If several progressively larger local searches fail, fall back
                             # to a robust full-frame OCR pass. This catches targets that moved
                             # outside the predicted ROI after a sudden motion/occlusion.
-                            if not local and attempts >= 3 and (attempts - 3) % 3 == 0:
+                            if not local and attempts >= 2 and (attempts - 2) % 2 == 0:
                                 global_recovery, _ = self._ocr(
                                     reader, frame, frame_no, full_frame=True, robust=True)
                                 detections.extend(global_recovery)
@@ -1486,38 +1581,68 @@ class OCRTrackingThread(QThread):
                 if detections and tracks:
                     tids = list(tracks.keys())
                     cost = np.full((len(tids), len(detections)), 1e6, dtype=np.float64)
+                    
                     for i, tid in enumerate(tids):
                         tr = tracks[tid]
                         pred = tr.get('predicted_roi') or tr['roi']
                         pc = self._center(pred)
                         gate = max(35.0, math.hypot(pred[2], pred[3])*1.75 + tr['speed']*1.5)
+
+                        old_center = self._center(tr['roi'])
+                        pred_center = self._center(pred)
+                        expected_vec = (pred_center[0] - old_center[0], pred_center[1] - old_center[1])
+                        expected_speed = math.hypot(expected_vec[0], expected_vec[1])
+
                         for j, det in enumerate(detections):
                             box, text, conf = det
                             dc = self._center(box)
                             dist = math.hypot(pc[0]-dc[0], pc[1]-dc[1])
                             iou = self._iou(pred, box)
                             app = self._appearance_score(tr.get('appearance'), self._appearance(frame, box))
-                            text_match = (not self.target_text.strip() or
-                                self._normalize(self.target_text) in self._normalize(text))
-                            # Do not associate a distant same-text detection solely because
-                            # the text looks alike. It must be close to the motion prediction
-                            # or have meaningful box overlap.
+                            text_match = (not self.target_text.strip() or 
+                                        self._normalize(self.target_text) in self._normalize(text))
+                            
+                            dir_penalty = 0.0
+                            if expected_speed > 3.0:
+                                actual_vec = (dc[0] - old_center[0], dc[1] - old_center[1])
+                                actual_mag = math.hypot(actual_vec[0], actual_vec[1])
+                                if actual_mag > 0:
+                                    cos_sim = (expected_vec[0]*actual_vec[0] + expected_vec[1]*actual_vec[1]) / (expected_speed * actual_mag)
+                                    dir_penalty = 0.20 * (1.0 - cos_sim)
+                                    
+                            # 尺寸變化懲罰 (Size Penalty)
+                            pw, ph = max(2.0, pred[2]), max(2.0, pred[3])
+                            bw, bh = max(2.0, box[2]), max(2.0, box[3])
+                            size_change = max(abs(bw - pw) / pw, abs(bh - ph) / ph)
+                            size_penalty = min(2.0, size_change * 1.5) if size_change > 0.5 else 0.0
+
                             lost_track = int(tr.get('lost', 0)) > 0
-                            # A reacquired exact OCR text may be far from the stale motion
-                            # prediction after a sudden move or occlusion. Permit a wider,
-                            # bounded association gate for lost tracks; Hungarian matching
-                            # still assigns each detection to at most one track.
                             lost_gate = max(gate, min(math.hypot(frame_w, frame_h) * 0.45, 900.0))
-                            geometrically_plausible = (
-                                (dist <= gate and (iou >= .02 or dist <= gate * .70 or app >= .72))
-                                or iou >= .15
+                            effective_gate = lost_gate if (lost_track and text_match) else gate
+                            
+                            motion_score = max(0.0, 1.0 - (dist / effective_gate))
+                            motion_score = max(0.0, motion_score - dir_penalty)
+                            ocr_score = conf if text_match else 0.0
+                            
+                            fuzzy_result = IntuitionisticFuzzyDecision.evaluate(
+                                ocr_confidence=ocr_score,
+                                motion_score=motion_score,
+                                appearance_score=app,
+                                iou_score=iou
                             )
-                            recovery_plausible = lost_track and text_match and (dist <= lost_gate or app >= .78)
-                            if geometrically_plausible or recovery_plausible:
-                                effective_gate = lost_gate if recovery_plausible else gate
-                                cost[i,j] = .55*(1-iou) + .30*min(1.0, dist/effective_gate) + .10*(1-app) + .05*(1-conf)
-                                if not text_match:
-                                    cost[i,j] += .5
+                            
+                            base_cost = fuzzy_result['nu'] + 0.35 * fuzzy_result['pi'] + size_penalty
+                            
+                            if fuzzy_result['decision'] == 'REJECT':
+                                base_cost += 1.0
+                            elif fuzzy_result['decision'] == 'UNCERTAIN':
+                                if lost_track and text_match and conf >= 0.4:
+                                    base_cost += 0.10
+                                else:
+                                    base_cost += 0.35
+                                
+                            cost[i, j] = base_cost
+                                    
                     if linear_sum_assignment is not None:
                         rows, cols = linear_sum_assignment(cost)
                         pairs = list(zip(rows.tolist(), cols.tolist()))
