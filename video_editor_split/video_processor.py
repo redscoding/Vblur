@@ -1,4 +1,4 @@
-﻿"""Multi-target tracking + sparse full-frame/local RapidOCR verification + mosaic export.
+"""Multi-target tracking + sparse full-frame/local RapidOCR verification + mosaic export.
 
 Requires: opencv-contrib-python, rapidocr-onnxruntime, PyQt5. EasyOCR/PyTorch is not used.
 tracking_data format: {absolute_frame_index: [(x, y, w, h), ...]}
@@ -107,8 +107,8 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 5           # 快速位移時更頻繁全畫面 OCR，降低錯過新位置的時間。
-    LOCAL_RECOVERY_INTERVAL = 2       # 追蹤遺失時每 2 幀重試局部 OCR，縮短重新定位延遲
+    GLOBAL_OCR_INTERVAL = 12          # 降低全畫面 OCR 次數；局部失效恢復仍會額外搜尋。
+    LOCAL_RECOVERY_INTERVAL = 3       # 僅在追蹤失效時做局部 OCR，避免過度辨識。
     MAX_OCR_ROI_DIM = 800             # 局部 OCR 搜尋區域的最大尺寸。
     MAX_GLOBAL_OCR_DIM = 1280         # 全畫面 OCR 的縮放尺寸上限。
     MIN_FEATURE_POINTS = 4
@@ -118,7 +118,7 @@ class OCRTrackingThread(QThread):
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
     MONITOR_INTERVAL = 2  # Update the live preview about 15 times/second at 30 FPS.
-    RETROACTIVE_SEGMENT_INTERVAL = 30  # 更頻繁檢查近期追蹤路徑。
+    RETROACTIVE_SEGMENT_INTERVAL = 60  # 減少回朔批次啟動頻率；每批仍共用影格 OCR 結果。
     INTERPOLATE_MAX_GAP = 2  # 保留舊的短缺口設定，路徑補遮另有獨立上限
     MAX_PATH_INTERPOLATION_GAP = 120  # OCR 仍無法確認時，最多以較寬路徑遮罩補 120 幀。
     PATH_MASK_EXPAND = 1.20  # 路徑推估 ROI 稍微擴大，降低位置估計誤差造成的漏遮
@@ -846,6 +846,9 @@ class OCRTrackingThread(QThread):
             except Exception:
                 return 0.5
 
+        # 每個影格的 OCR 候選最多只能分配給一個 ID，避免相鄰/重複文字在各自
+        # 的獨立路徑最佳化中被多個 ID 同時認領。
+        claimed_candidates_by_frame = {}
         # 逐段做 Viterbi/動態規劃。每個中間影格都有 OCR 候選；None 是允許的空缺狀態。
         for segment in segments:
             if self.was_cancelled:
@@ -880,6 +883,11 @@ class OCRTrackingThread(QThread):
                 for det in dets:
                     try:
                         roi = tuple(map(float, self._clip(frame, det[0])))
+                        # A candidate claimed by another ID on this same frame cannot be reused.
+                        # Only suppress near-identical boxes, not adjacent boxes that merely touch.
+                        if any(self._iou(roi, claimed) >= 0.78
+                               for claimed in claimed_candidates_by_frame.get(f, [])):
+                            continue
                         if roi[2] < 2 or roi[3] < 2:
                             continue
                         dcx, dcy = center(roi)
@@ -980,6 +988,7 @@ class OCRTrackingThread(QThread):
                     continue
                 measured = tuple(map(int, self._clip(frame, cand['roi'])))
                 track_history[f] = measured
+                claimed_candidates_by_frame.setdefault(f, []).append(measured)
                 matched += 1
                 self._draw_reverse_check(frame, f, display_track_id, measured, measured,
                                          '自適應路徑回溯：OCR 候選經跨影格評分')
@@ -1100,29 +1109,51 @@ class OCRTrackingThread(QThread):
                 reader, prev_frame, frame_no, full_frame=True, robust=True)
             checked += 1
 
-            # 以距離由近到遠配對，避免同一個 OCR 框被多個 ID 重複使用。
-            pairs = []
-            for track_id, _state in active:
-                predicted, _motion_ok = predictions[track_id]
-                sx, sy, sw, sh = search_rois[track_id]
-                pcx, pcy = self._center(predicted)
-                for det_index, detection in enumerate(detections):
-                    box = detection[0]
-                    dcx, dcy = self._center(box)
-                    inside = (sx <= dcx <= sx + sw and sy <= dcy <= sy + sh)
-                    if inside or self._iou(box, search_rois[track_id]) > 0:
-                        distance = math.hypot(dcx - pcx, dcy - pcy)
-                        pairs.append((distance, track_id, det_index))
-            pairs.sort(key=lambda item: item[0])
-            assigned_tracks = set()
-            assigned_detections = set()
+            # 每個反向影格採全域一對一配對。只在預測搜尋區內、且位移/尺寸合理時才允許
+            # 配對；不再因搜尋框重疊就把鄰近 ID 的 OCR 候選硬配過來。
             assignment = {}
-            for _distance, track_id, det_index in pairs:
-                if track_id in assigned_tracks or det_index in assigned_detections:
-                    continue
-                assigned_tracks.add(track_id)
-                assigned_detections.add(det_index)
-                assignment[track_id] = detections[det_index]
+            if active and detections:
+                invalid_cost = 1.0e6
+                cost = np.full((len(active), len(detections)), invalid_cost, dtype=np.float64)
+                for ai, (track_id, _state) in enumerate(active):
+                    predicted, motion_ok = predictions[track_id]
+                    sx, sy, sw, sh = search_rois[track_id]
+                    pcx, pcy = self._center(predicted)
+                    pw, ph = max(2.0, predicted[2]), max(2.0, predicted[3])
+                    # Search window is a coarse gate; use a tighter displacement gate to
+                    # prevent neighbouring repeated text from stealing this track's ID.
+                    max_dist = max(18.0, 0.85 * math.hypot(pw, ph))
+                    if not motion_ok:
+                        max_dist *= 0.80
+                    for di, detection in enumerate(detections):
+                        box = tuple(map(int, detection[0]))
+                        dcx, dcy = self._center(box)
+                        if not (sx <= dcx <= sx + sw and sy <= dcy <= sy + sh):
+                            continue
+                        dist = math.hypot(dcx - pcx, dcy - pcy)
+                        if dist > max_dist:
+                            continue
+                        bw, bh = max(2.0, box[2]), max(2.0, box[3])
+                        size_penalty = abs(math.log(bw / pw)) + abs(math.log(bh / ph))
+                        overlap = self._iou(box, predicted)
+                        # Smaller cost means stronger identity continuity.
+                        cost[ai, di] = (dist / max_dist) + 0.28 * min(3.0, size_penalty) - 0.18 * overlap
+                if linear_sum_assignment is not None:
+                    rows, cols = linear_sum_assignment(cost)
+                    proposed = zip(rows.tolist(), cols.tolist())
+                else:
+                    proposed = sorted((cost[i, j], i, j) for i in range(cost.shape[0])
+                                      for j in range(cost.shape[1]))
+                    used_rows, used_cols, pairs = set(), set(), []
+                    for c, i, j in proposed:
+                        if c < 1.05 and i not in used_rows and j not in used_cols:
+                            pairs.append((i, j)); used_rows.add(i); used_cols.add(j)
+                    proposed = pairs
+                for ai, di in proposed:
+                    if cost[ai, di] >= 1.05 or cost[ai, di] >= invalid_cost:
+                        continue
+                    track_id, _state = active[ai]
+                    assignment[track_id] = detections[di]
 
             for track_id, state in active:
                 predicted, motion_ok = predictions[track_id]
@@ -1141,19 +1172,13 @@ class OCRTrackingThread(QThread):
                         track_id=track_id, roi=measured, retro_checked=checked,
                         retro_matched=matched, batch_backfill=True)
                 else:
-                    # 維持既有策略：未被 OCR 確認時，仍將反向預測框寫入遮罩歷史。
-                    px, py, pw, ph = self._clip(prev_frame, predicted)
-                    ew = max(2, int(round(pw * self.PATH_MASK_EXPAND)))
-                    eh = max(2, int(round(ph * self.PATH_MASK_EXPAND)))
-                    predicted_mask = self._clip(
-                        prev_frame,
-                        (px + pw / 2.0 - ew / 2.0,
-                         py + ph / 2.0 - eh / 2.0, ew, eh))
-                    state["history"][frame_no] = tuple(map(int, predicted_mask))
+                    # OCR 未確認時，不把光流預測冒充成此 ID 的真實位置；否則鄰近目標
+                    # 很容易被錯誤 ID 遮住。保持 history 缺值，之後只有可信錨點支持時
+                    # 才允許短缺口插值，其他情況留給使用者檢查。
                     state["current_roi"] = predicted
                     self._draw_reverse_check(
                         prev_frame, frame_no, track_id, predicted, None,
-                        f"批次首次回溯，光流={'成功' if motion_ok else '備援'}")
+                        f"回溯未確認，保留空缺（光流={'成功' if motion_ok else '備援'}）")
 
                 state["current_frame_no"] = frame_no
                 state["current_frame"] = prev_frame
@@ -1250,10 +1275,6 @@ class OCRTrackingThread(QThread):
             next_id = 1
             hit_frame = self.start_frame
             reader = None
-            if self.target_text.strip():
-                self.progress_signal.emit(hit_frame, '正在初始化 RapidOCR（ONNX Runtime）...')
-                reader = self._create_reader()
-                self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
             if self.initial_roi is None:
                 raise RuntimeError('目前模式需要先在影片預覽畫面框選一個追蹤目標。')
             roi = self._clip(first_frame, self.initial_roi)
@@ -1269,12 +1290,21 @@ class OCRTrackingThread(QThread):
             frame_h, frame_w = first_frame.shape[:2]
 
             # Start output history at the initialization frame.
+            # ID identity is retained as history[track_id][absolute_frame] = ROI.
+            # Export data remains the GUI-compatible list of ROIs per frame.
             history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
             # Only OCR/manual initialization frames are trusted anchors. Visual tracker boxes
             # may drift after fast motion and must not be used as the left anchor for backfill.
             ocr_history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
             data[hit_frame] = [tuple(t['roi']) for t in tracks.values()]
+            # 先送出第一張監控影格，再載入 OCR 引擎；UI 不必等待 OCR 初始化完成。
             self._draw_monitor(first_frame, hit_frame, tracks, 'TRACK MODE')
+            if self.target_text.strip():
+                self.progress_signal.emit(hit_frame, '監控已啟動；正在背景初始化 RapidOCR...')
+                self._report('monitor_ready', '即時監控已顯示，OCR 引擎正在背景初始化。', hit_frame,
+                             monitor_ready=True, track_ids=list(tracks.keys()))
+                reader = self._create_reader()
+                self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
             previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
             cached_global_motion = cached_camera_dx = cached_camera_dy = 0.0
             cached_global_points = 0
@@ -1505,7 +1535,7 @@ class OCRTrackingThread(QThread):
                         recovery_due.append(tid)
 
                 if reader is not None:
-                    # Full-frame OCR only at sparse keyframes (default every 5 frames),
+                    # Full-frame OCR only at sparse keyframes (default every 12 frames),
                     # resized to at most 960 px. This is necessary to find a target that
                     # appears outside the selected object's local search area.
                     if should_global_ocr:
