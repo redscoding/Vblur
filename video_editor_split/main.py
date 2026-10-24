@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 import os
 import time
@@ -330,6 +331,7 @@ class ProVideoEditor(QMainWindow):
         self.ocr_thread = None
         self.monitor_dialog = None
         self.progress_dialog = None
+        self._tracking_stop_requested = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.init_ui()
@@ -618,6 +620,7 @@ class ProVideoEditor(QMainWindow):
             return
         # 目標文字留白：只使用手動框選 + 視覺追蹤（較快）；有填文字才啟用 OCR 驗證。
 
+        self._tracking_stop_requested = False
         self.monitor_dialog = OCRMonitorDialog(self)
         self.monitor_dialog.show()
         self.progress_dialog = QProgressDialog("正在啟動追蹤...", "停止此段並保留", self.current_frame,
@@ -631,10 +634,10 @@ class ProVideoEditor(QMainWindow):
             self.video_path, self.current_frame, self.total_frames, target,
             initial_roi=initial_roi
         )
-        self.progress_dialog.canceled.connect(self.ocr_thread.requestInterruption)
+        self.progress_dialog.canceled.connect(self.cancel_tracking_and_keep)
         self.ocr_thread.progress_signal.connect(self.update_ocr_progress)
-        self.ocr_thread.monitor_frame_signal.connect(self.monitor_dialog.update_frame)
-        self.ocr_thread.monitor_data_signal.connect(self.monitor_dialog.update_data)
+        self.ocr_thread.monitor_frame_signal.connect(self.update_tracking_monitor_frame)
+        self.ocr_thread.monitor_data_signal.connect(self.update_tracking_monitor_data)
         self.ocr_thread.finished_signal.connect(self.on_ocr_finished)
         self.btn_ocr.setEnabled(False)
         self.progress_dialog.show()
@@ -643,7 +646,33 @@ class ProVideoEditor(QMainWindow):
         self.monitor_dialog.raise_()
         self.monitor_dialog.activateWindow()
 
+    def cancel_tracking_and_keep(self):
+        # Stop tracking and close progress/monitor UI immediately; worker keeps completed frames.
+        self._tracking_stop_requested = True
+        thread = self.ocr_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+        if self.progress_dialog is not None:
+            self.progress_dialog.blockSignals(True)
+            self.progress_dialog.close()
+        if self.monitor_dialog is not None:
+            self.monitor_dialog.close()
+        self.lbl_status.setText("正在停止追蹤並保留已完成影格；不再執行後續回溯補查...")
+
+    def update_tracking_monitor_frame(self, frame, frame_no, mode):
+        if self._tracking_stop_requested or self.monitor_dialog is None:
+            return
+        self.monitor_dialog.update_frame(frame, frame_no, mode)
+
+    def update_tracking_monitor_data(self, data):
+        if self._tracking_stop_requested or self.monitor_dialog is None:
+            return
+        self.monitor_dialog.update_data(data)
+
     def update_ocr_progress(self, val, msg):
+        # Avoid QProgressDialog.setValue() after cancellation, which can show it again on some Qt versions.
+        if self._tracking_stop_requested:
+            return
         if self.progress_dialog:
             self.progress_dialog.setValue(val)
             self.progress_dialog.setLabelText(msg)
@@ -684,9 +713,10 @@ class ProVideoEditor(QMainWindow):
             QMessageBox.information(self, "已保留追蹤段落", f"已保留 F{task['start']} 到 F{task['end']} 的追蹤資料。\n接著可移動到其他影格，框選下一個目標或下一段，再開始追蹤。")
         else:
             self.lbl_status.setText(f"追蹤完成：F{task['start']}–F{task['end']}；最多同時 {max_targets} 個框。")
-        if self.monitor_dialog:
+        if self.monitor_dialog and not was_cancelled:
             self.monitor_dialog.raise_()
             self.monitor_dialog.activateWindow()
+        self._tracking_stop_requested = False
 
     def add_new_task(self):
         if not self.cap or self.current_raw_frame is None:

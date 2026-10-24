@@ -5,6 +5,7 @@ tracking_data format: {absolute_frame_index: [(x, y, w, h), ...]}
 """
 import math
 import time
+from difflib import SequenceMatcher
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -18,28 +19,36 @@ except Exception:
 
 
 class IntuitionisticFuzzyDecision:
-    """Small IFS evidence combiner. Scores are heuristics and must be calibrated per dataset."""
+    """Intuitionistic-fuzzy qualification for OCR candidates only.
+
+    Fuzzy inference answers: "Does this OCR result look like the requested target?"
+    It is deliberately NOT used to draw mosaics or to assign an existing track ID.
+    Track association uses explicit geometric/motion costs and one-to-one assignment.
+    Scores are heuristic and should be calibrated against the user's video samples.
+    """
 
     @staticmethod
-    def evaluate(ocr_confidence, motion_score, appearance_score, iou_score):
-        values = [float(np.clip(v, 0.0, 1.0)) for v in
-                  (ocr_confidence, motion_score, appearance_score, iou_score)]
-        ocr, motion, appearance, iou = values
-        support = 0.50 * ocr + 0.22 * motion + 0.18 * appearance + 0.10 * iou
-        opposition = 0.38 * (1.0 - motion) + 0.30 * (1.0 - appearance) + 0.32 * (1.0 - ocr)
-        # Construct an intuitionistic fuzzy pair with mu + nu <= 1.
-        mu = support * (1.0 - opposition)
-        nu = opposition * (1.0 - support)
-        mu = float(np.clip(mu, 0.0, 1.0))
-        nu = float(np.clip(nu, 0.0, 1.0 - mu))
+    def evaluate_target(ocr_confidence, text_similarity):
+        confidence = float(np.clip(ocr_confidence, 0.0, 1.0))
+        similarity = float(np.clip(text_similarity, 0.0, 1.0))
+
+        # Text agreement is the primary evidence; OCR confidence is supporting evidence.
+        support = 0.72 * similarity + 0.28 * confidence
+        opposition = 0.82 * (1.0 - similarity) + 0.18 * (1.0 - confidence)
+        mu = float(np.clip(support * (1.0 - opposition), 0.0, 1.0))
+        nu = float(np.clip(opposition * (1.0 - support), 0.0, 1.0 - mu))
         pi = float(np.clip(1.0 - mu - nu, 0.0, 1.0))
-        if mu >= 0.28 and mu > nu:
+
+        # Conservative target qualification: fuzzy logic filters OCR candidates;
+        # it does not decide whether a frame should be mosaicked.
+        if similarity >= 0.72 and mu >= 0.30 and mu > nu:
             decision = "ACCEPT"
-        elif pi >= 0.36 or abs(mu - nu) < 0.08:
+        elif similarity >= 0.48 and (pi >= 0.12 or abs(mu - nu) < 0.12):
             decision = "UNCERTAIN"
         else:
             decision = "REJECT"
-        return {"mu": mu, "nu": nu, "pi": pi, "decision": decision}
+        return {"mu": mu, "nu": nu, "pi": pi, "decision": decision,
+                "text_similarity": similarity, "ocr_confidence": confidence}
 
 
 class SortMotionModel:
@@ -97,8 +106,8 @@ class SortMotionModel:
 class OCRTrackingThread(QThread):
     """Fast tracking worker: Kalman/SORT-style state, optical-flow updates, OCR on demand.
 
-    initial_roi: optional (x, y, w, h) in the start_frame. If supplied, the worker
-    starts from the user's selection and does not need full-frame OCR to initialize.
+    initial_roi: required (x, y, w, h) in the start_frame. The user's selection is kept,
+    while a one-time overlapping-tile OCR scan initializes other targets in the same frame.
     tracking_data format remains {absolute_frame_index: [(x, y, w, h), ...]}.
     """
     progress_signal = pyqtSignal(int, str)
@@ -107,8 +116,8 @@ class OCRTrackingThread(QThread):
     monitor_data_signal = pyqtSignal(dict)
 
     # OCR runs only on sparse keyframes or after tracking loss, never every frame.
-    GLOBAL_OCR_INTERVAL = 12          # 降低全畫面 OCR 次數；局部失效恢復仍會額外搜尋。
-    LOCAL_RECOVERY_INTERVAL = 3       # 僅在追蹤失效時做局部 OCR，避免過度辨識。
+    GLOBAL_OCR_INTERVAL = 5           # 快速位移時更頻繁全畫面 OCR，降低錯過新位置的時間。
+    LOCAL_RECOVERY_INTERVAL = 2       # 追蹤遺失時每 2 幀重試局部 OCR，縮短重新定位延遲
     MAX_OCR_ROI_DIM = 800             # 局部 OCR 搜尋區域的最大尺寸。
     MAX_GLOBAL_OCR_DIM = 1280         # 全畫面 OCR 的縮放尺寸上限。
     MIN_FEATURE_POINTS = 4
@@ -118,7 +127,7 @@ class OCRTrackingThread(QThread):
     DETECT_CANVAS_SIZE = 1280
     MIN_OCR_CONFIDENCE = 0.20
     MONITOR_INTERVAL = 2  # Update the live preview about 15 times/second at 30 FPS.
-    RETROACTIVE_SEGMENT_INTERVAL = 60  # 減少回朔批次啟動頻率；每批仍共用影格 OCR 結果。
+    RETROACTIVE_SEGMENT_INTERVAL = 30  # 更頻繁檢查近期追蹤路徑。
     INTERPOLATE_MAX_GAP = 2  # 保留舊的短缺口設定，路徑補遮另有獨立上限
     MAX_PATH_INTERPOLATION_GAP = 120  # OCR 仍無法確認時，最多以較寬路徑遮罩補 120 幀。
     PATH_MASK_EXPAND = 1.20  # 路徑推估 ROI 稍微擴大，降低位置估計誤差造成的漏遮
@@ -230,6 +239,42 @@ class OCRTrackingThread(QThread):
     @staticmethod
     def _normalize(text):
         return ''.join(ch for ch in str(text).casefold() if ch.isalnum())
+
+    @staticmethod
+    def _text_similarity(target, detected):
+        """Compare normalized OCR text with the requested target, tolerating small OCR errors."""
+        target = ''.join(ch for ch in str(target).casefold() if ch.isalnum())
+        detected = ''.join(ch for ch in str(detected).casefold() if ch.isalnum())
+        if not target or not detected:
+            return 0.0
+        if target in detected:
+            return 1.0
+        # Very short identifiers are too ambiguous for fuzzy matching; require exact containment.
+        if len(target) < 3:
+            return 0.0
+        best = SequenceMatcher(None, target, detected).ratio()
+        # OCR can attach one or two neighbouring characters to a text box. Compare local
+        # windows around target length as well as the entire detected string.
+        low = max(1, len(target) - 2)
+        high = min(len(detected), len(target) + 2)
+        for window_len in range(low, high + 1):
+            for offset in range(0, len(detected) - window_len + 1):
+                candidate = detected[offset:offset + window_len]
+                best = max(best, SequenceMatcher(None, target, candidate).ratio())
+        return float(best)
+
+    def _target_text_evidence(self, text, confidence):
+        target = self._normalize(self.target_text)
+        detected = self._normalize(text)
+        if not target:
+            return {"decision": "REJECT", "mu": 0.0, "nu": 1.0, "pi": 0.0,
+                    "text_similarity": 0.0, "ocr_confidence": float(confidence)}
+        similarity = self._text_similarity(target, detected)
+        result = IntuitionisticFuzzyDecision.evaluate_target(confidence, similarity)
+        # Do not let fuzzy matching loosen short codes or low-quality OCR too much.
+        if len(target) < 3 and target not in detected:
+            result["decision"] = "REJECT"
+        return result
 
     @staticmethod
     def _create_reader():
@@ -559,11 +604,20 @@ class OCRTrackingThread(QThread):
                 # using a large fixed expansion that merges neighbouring targets in dense scenes.
                 px, py = max(1, int(round(bw * 0.04))), max(1, int(round(bh * 0.08)))
                 box = self._clip(frame, (x+x1-px, y+y1-py, bw+2*px, bh+2*py))
-                matched = bool(conf >= self.MIN_OCR_CONFIDENCE and target and target in normalized)
+                target_evidence = self._target_text_evidence(text, conf)
+                matched = bool(
+                    conf >= self.MIN_OCR_CONFIDENCE
+                    and target_evidence['decision'] == 'ACCEPT'
+                )
                 raw.append({'text': text, 'confidence': float(conf), 'variant': variant_name,
-                            'bbox': tuple(map(int, box)), 'matched': matched})
-                # Draw every OCR candidate in the monitor, including non-matching text.
-                # Only target matches may create or update tracked identities.
+                            'bbox': tuple(map(int, box)), 'matched': matched,
+                            'target_similarity': target_evidence['text_similarity'],
+                            'fuzzy_mu': target_evidence['mu'],
+                            'fuzzy_nu': target_evidence['nu'],
+                            'fuzzy_pi': target_evidence['pi'],
+                            'target_decision': target_evidence['decision']})
+                # Fuzzy inference is used only to qualify OCR candidates as target text.
+                # Accepted target boxes are passed to the tracking/data-association stage.
                 if matched:
                     found.append((box, text, conf))
             if found:
@@ -586,6 +640,98 @@ class OCRTrackingThread(QThread):
                      ocr_results=raw[:20], roi=(x, y, w, h), mode=mode,
                      target_text=self.target_text)
         return unique, elapsed
+
+    def _initial_tiled_ocr_scan(self, reader, frame, frame_no):
+        """One-time dense-scene initialization scan using overlapping, native-resolution tiles.
+
+        A single downscaled full-frame OCR pass can miss small/repeated text in dense scenes.
+        This bounded scan runs only at initialization. Each tile uses the existing OCR path,
+        which tries alternate preprocessing only when the original tile has no target match.
+        Overlapping tile detections are merged conservatively so nearby repeated targets keep
+        separate identities.
+        """
+        if reader is None or not self.target_text.strip():
+            return []
+
+        frame_h, frame_w = frame.shape[:2]
+        tile_limit = max(160, min(int(self.MAX_OCR_ROI_DIM), 800))
+        tile_w = min(tile_limit, frame_w)
+        tile_h = min(tile_limit, frame_h)
+        overlap_ratio = 0.20
+
+        def positions(length, tile_length):
+            if length <= tile_length:
+                return [0]
+            step = max(1, int(round(tile_length * (1.0 - overlap_ratio))))
+            values = list(range(0, max(1, length - tile_length + 1), step))
+            values.append(length - tile_length)
+            return sorted(set(values))
+
+        xs = positions(frame_w, tile_w)
+        ys = positions(frame_h, tile_h)
+        tile_count = len(xs) * len(ys)
+        self._report(
+            'initial_dense_scan',
+            f'起始影格密集目標掃描：{len(xs)}×{len(ys)} 個重疊區塊，避免只縮小全畫面而漏掉小字。',
+            frame_no, tile_count=tile_count, initialization_scan=True)
+
+        candidates = []
+        checked = 0
+        for yi, y in enumerate(ys):
+            for xi, x in enumerate(xs):
+                if self.isInterruptionRequested():
+                    return self._merge_initial_detections(candidates)
+                roi = (x, y, min(tile_w, frame_w - x), min(tile_h, frame_h - y))
+                found, _elapsed = self._ocr(
+                    reader, frame, frame_no, roi=roi, full_frame=False, robust=True)
+                candidates.extend(found)
+                checked += 1
+                self._report(
+                    'initial_dense_scan_tile',
+                    f'起始影格掃描區塊 {checked}/{tile_count}；目前找到 {len(self._merge_initial_detections(candidates))} 個候選目標。',
+                    frame_no, tile_index=checked, tile_count=tile_count,
+                    candidate_count=len(candidates), initialization_scan=True)
+
+        merged = self._merge_initial_detections(candidates)
+        self._report(
+            'initial_dense_scan_done',
+            f'起始影格密集掃描完成：共檢查 {checked} 個區塊，合併後有 {len(merged)} 個目標候選。',
+            frame_no, tile_count=checked, target_count=len(merged), initialization_scan=True)
+        return merged
+
+    def _merge_initial_detections(self, detections):
+        """Merge duplicate OCR boxes from overlapping tiles without collapsing neighbours."""
+        ranked = sorted(detections, key=lambda item: float(item[2]), reverse=True)
+        merged = []
+        for detection in ranked:
+            box, text, confidence = detection
+            duplicate_index = None
+            for index, existing in enumerate(merged):
+                old_box, old_text, old_confidence = existing
+                iou = self._iou(box, old_box)
+                # Strong overlap is needed: a mere close center is not enough because dense
+                # rows may contain multiple identical target strings side by side.
+                if iou >= 0.58:
+                    duplicate_index = index
+                    break
+                x1 = max(box[0], old_box[0]); y1 = max(box[1], old_box[1])
+                x2 = min(box[0] + box[2], old_box[0] + old_box[2])
+                y2 = min(box[1] + box[3], old_box[1] + old_box[3])
+                intersection = max(0, x2 - x1) * max(0, y2 - y1)
+                min_area = max(1, min(box[2] * box[3], old_box[2] * old_box[3]))
+                center_distance = math.hypot(
+                    self._center(box)[0] - self._center(old_box)[0],
+                    self._center(box)[1] - self._center(old_box)[1])
+                if (intersection / min_area >= 0.88 and
+                        center_distance <= max(4.0, min(box[2], box[3], old_box[2], old_box[3]) * 0.22)):
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                merged.append((tuple(map(int, box)), str(text), float(confidence)))
+            elif float(confidence) > float(merged[duplicate_index][2]):
+                merged[duplicate_index] = (tuple(map(int, box)), str(text), float(confidence))
+        merged.sort(key=lambda item: (self._center(item[0])[1], self._center(item[0])[0]))
+        return merged
 
     def _draw_monitor(self, frame, frame_no, tracks, mode):
         shown = frame.copy()
@@ -846,9 +992,6 @@ class OCRTrackingThread(QThread):
             except Exception:
                 return 0.5
 
-        # 每個影格的 OCR 候選最多只能分配給一個 ID，避免相鄰/重複文字在各自
-        # 的獨立路徑最佳化中被多個 ID 同時認領。
-        claimed_candidates_by_frame = {}
         # 逐段做 Viterbi/動態規劃。每個中間影格都有 OCR 候選；None 是允許的空缺狀態。
         for segment in segments:
             if self.was_cancelled:
@@ -883,11 +1026,6 @@ class OCRTrackingThread(QThread):
                 for det in dets:
                     try:
                         roi = tuple(map(float, self._clip(frame, det[0])))
-                        # A candidate claimed by another ID on this same frame cannot be reused.
-                        # Only suppress near-identical boxes, not adjacent boxes that merely touch.
-                        if any(self._iou(roi, claimed) >= 0.78
-                               for claimed in claimed_candidates_by_frame.get(f, [])):
-                            continue
                         if roi[2] < 2 or roi[3] < 2:
                             continue
                         dcx, dcy = center(roi)
@@ -988,7 +1126,6 @@ class OCRTrackingThread(QThread):
                     continue
                 measured = tuple(map(int, self._clip(frame, cand['roi'])))
                 track_history[f] = measured
-                claimed_candidates_by_frame.setdefault(f, []).append(measured)
                 matched += 1
                 self._draw_reverse_check(frame, f, display_track_id, measured, measured,
                                          '自適應路徑回溯：OCR 候選經跨影格評分')
@@ -1109,51 +1246,40 @@ class OCRTrackingThread(QThread):
                 reader, prev_frame, frame_no, full_frame=True, robust=True)
             checked += 1
 
-            # 每個反向影格採全域一對一配對。只在預測搜尋區內、且位移/尺寸合理時才允許
-            # 配對；不再因搜尋框重疊就把鄰近 ID 的 OCR 候選硬配過來。
+            # 以距離由近到遠配對，避免同一個 OCR 框被多個 ID 重複使用。
+            pairs = []
+            for track_id, _state in active:
+                predicted, _motion_ok = predictions[track_id]
+                sx, sy, sw, sh = search_rois[track_id]
+                pcx, pcy = self._center(predicted)
+                for det_index, detection in enumerate(detections):
+                    box = detection[0]
+                    dcx, dcy = self._center(box)
+                    distance = math.hypot(dcx - pcx, dcy - pcy)
+                    predicted_iou = self._iou(box, predicted)
+                    # A broad expanded search window is for OCR discovery only, not proof of
+                    # identity. Require a plausible one-frame motion distance or real overlap.
+                    diag = math.hypot(max(2, predicted[2]), max(2, predicted[3]))
+                    motion_gate = max(18.0, diag * 1.25)
+                    size_ratio = max(
+                        box[2] / max(1.0, predicted[2]), predicted[2] / max(1.0, box[2]),
+                        box[3] / max(1.0, predicted[3]), predicted[3] / max(1.0, box[3]))
+                    plausible_size = size_ratio <= 2.5
+                    if plausible_size and (distance <= motion_gate or predicted_iou >= 0.10):
+                        # Mild size penalty helps prefer the same physical text box when
+                        # neighbouring targets are close and have similar OCR strings.
+                        size_penalty = max(0.0, math.log(max(1.0, size_ratio))) * diag * 0.15
+                        pairs.append((distance + size_penalty, track_id, det_index))
+            pairs.sort(key=lambda item: item[0])
+            assigned_tracks = set()
+            assigned_detections = set()
             assignment = {}
-            if active and detections:
-                invalid_cost = 1.0e6
-                cost = np.full((len(active), len(detections)), invalid_cost, dtype=np.float64)
-                for ai, (track_id, _state) in enumerate(active):
-                    predicted, motion_ok = predictions[track_id]
-                    sx, sy, sw, sh = search_rois[track_id]
-                    pcx, pcy = self._center(predicted)
-                    pw, ph = max(2.0, predicted[2]), max(2.0, predicted[3])
-                    # Search window is a coarse gate; use a tighter displacement gate to
-                    # prevent neighbouring repeated text from stealing this track's ID.
-                    max_dist = max(18.0, 0.85 * math.hypot(pw, ph))
-                    if not motion_ok:
-                        max_dist *= 0.80
-                    for di, detection in enumerate(detections):
-                        box = tuple(map(int, detection[0]))
-                        dcx, dcy = self._center(box)
-                        if not (sx <= dcx <= sx + sw and sy <= dcy <= sy + sh):
-                            continue
-                        dist = math.hypot(dcx - pcx, dcy - pcy)
-                        if dist > max_dist:
-                            continue
-                        bw, bh = max(2.0, box[2]), max(2.0, box[3])
-                        size_penalty = abs(math.log(bw / pw)) + abs(math.log(bh / ph))
-                        overlap = self._iou(box, predicted)
-                        # Smaller cost means stronger identity continuity.
-                        cost[ai, di] = (dist / max_dist) + 0.28 * min(3.0, size_penalty) - 0.18 * overlap
-                if linear_sum_assignment is not None:
-                    rows, cols = linear_sum_assignment(cost)
-                    proposed = zip(rows.tolist(), cols.tolist())
-                else:
-                    proposed = sorted((cost[i, j], i, j) for i in range(cost.shape[0])
-                                      for j in range(cost.shape[1]))
-                    used_rows, used_cols, pairs = set(), set(), []
-                    for c, i, j in proposed:
-                        if c < 1.05 and i not in used_rows and j not in used_cols:
-                            pairs.append((i, j)); used_rows.add(i); used_cols.add(j)
-                    proposed = pairs
-                for ai, di in proposed:
-                    if cost[ai, di] >= 1.05 or cost[ai, di] >= invalid_cost:
-                        continue
-                    track_id, _state = active[ai]
-                    assignment[track_id] = detections[di]
+            for _distance, track_id, det_index in pairs:
+                if track_id in assigned_tracks or det_index in assigned_detections:
+                    continue
+                assigned_tracks.add(track_id)
+                assigned_detections.add(det_index)
+                assignment[track_id] = detections[det_index]
 
             for track_id, state in active:
                 predicted, motion_ok = predictions[track_id]
@@ -1172,13 +1298,19 @@ class OCRTrackingThread(QThread):
                         track_id=track_id, roi=measured, retro_checked=checked,
                         retro_matched=matched, batch_backfill=True)
                 else:
-                    # OCR 未確認時，不把光流預測冒充成此 ID 的真實位置；否則鄰近目標
-                    # 很容易被錯誤 ID 遮住。保持 history 缺值，之後只有可信錨點支持時
-                    # 才允許短缺口插值，其他情況留給使用者檢查。
+                    # 維持既有策略：未被 OCR 確認時，仍將反向預測框寫入遮罩歷史。
+                    px, py, pw, ph = self._clip(prev_frame, predicted)
+                    ew = max(2, int(round(pw * self.PATH_MASK_EXPAND)))
+                    eh = max(2, int(round(ph * self.PATH_MASK_EXPAND)))
+                    predicted_mask = self._clip(
+                        prev_frame,
+                        (px + pw / 2.0 - ew / 2.0,
+                         py + ph / 2.0 - eh / 2.0, ew, eh))
+                    state["history"][frame_no] = tuple(map(int, predicted_mask))
                     state["current_roi"] = predicted
                     self._draw_reverse_check(
                         prev_frame, frame_no, track_id, predicted, None,
-                        f"回溯未確認，保留空缺（光流={'成功' if motion_ok else '備援'}）")
+                        f"批次首次回溯，光流={'成功' if motion_ok else '備援'}")
 
                 state["current_frame_no"] = frame_no
                 state["current_frame"] = prev_frame
@@ -1270,41 +1402,91 @@ class OCRTrackingThread(QThread):
                 raise RuntimeError('無法讀取追蹤起始影格。')
             self.frame_buffer.put(self.start_frame, first_frame)
 
-            # Strict ROI-only design: the user must draw the target box; no full-frame OCR.
+            # Dense-scene initialization: preserve the user's ROI, but also scan the entire
+            # first frame once in overlapping tiles so small/repeated targets are not ignored.
             tracks = {}
             next_id = 1
             hit_frame = self.start_frame
             reader = None
+            if self.target_text.strip():
+                self.progress_signal.emit(hit_frame, '正在初始化 RapidOCR（ONNX Runtime）...')
+                reader = self._create_reader()
+                self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
             if self.initial_roi is None:
                 raise RuntimeError('目前模式需要先在影片預覽畫面框選一個追蹤目標。')
-            roi = self._clip(first_frame, self.initial_roi)
-            if roi[2] < 3 or roi[3] < 3:
+            manual_roi = self._clip(first_frame, self.initial_roi)
+            if manual_roi[2] < 3 or manual_roi[3] < 3:
                 raise RuntimeError('框選的 ROI 太小，請重新框選較完整的目標。')
-            tracks[next_id] = self._new_track(first_frame, roi, next_id, hit_frame,
-                                              self.target_text, 1.0)
-            self._report('locked', f'已鎖定手動框選的追蹤目標：ROI={roi}', hit_frame,
-                         roi=roi, mode='INIT')
+
+            initial_detections = self._initial_tiled_ocr_scan(reader, first_frame, hit_frame)
+            matched_initial_index = None
+            if initial_detections:
+                mcx, mcy = self._center(manual_roi)
+                manual_diag = math.hypot(manual_roi[2], manual_roi[3])
+                candidates = []
+                for idx, det in enumerate(initial_detections):
+                    box = det[0]
+                    dcx, dcy = self._center(box)
+                    distance = math.hypot(mcx - dcx, mcy - dcy)
+                    overlap = self._iou(manual_roi, box)
+                    # The manually selected ROI remains the size/position prior. Match only
+                    # the nearest plausible OCR box; do not suppress other nearby targets.
+                    if overlap >= 0.08 or distance <= max(14.0, min(48.0, manual_diag * 0.45)):
+                        score = distance / max(1.0, manual_diag) - 0.70 * overlap
+                        candidates.append((score, idx))
+                if candidates:
+                    matched_initial_index = min(candidates)[1]
+
+            # ID 1 always represents the user's explicitly selected target. If OCR sees it,
+            # store its OCR box as the trusted anchor while retaining the user's ROI for masks.
+            manual_text, manual_conf = self.target_text, 1.0
+            if matched_initial_index is not None:
+                _box, manual_text, manual_conf = initial_detections[matched_initial_index]
+            tracks[next_id] = self._new_track(
+                first_frame, manual_roi, next_id, hit_frame, manual_text, manual_conf)
+            tracks[next_id]['state'] = 'MANUAL_INIT'
+            manual_id = next_id
+            next_id += 1
+
+            # Every distinct first-frame OCR detection becomes its own stable ID. Only the
+            # single OCR box paired with the manual ROI is skipped; neighbouring repeated text
+            # is intentionally not discarded just because it is close to the manual selection.
+            initial_id_count = 1
+            for idx, det in enumerate(initial_detections):
+                if idx == matched_initial_index:
+                    continue
+                box, text, confidence = det
+                if any(self._iou(box, tr['roi']) >= 0.82 for tr in tracks.values()):
+                    continue
+                tracks[next_id] = self._new_track(first_frame, box, next_id, hit_frame, text, confidence)
+                tracks[next_id]['state'] = 'OCR_CONFIRMED'
+                next_id += 1
+                initial_id_count += 1
+
+            self._report(
+                'locked',
+                f'起始影格初始化完成：手動目標 ID {manual_id}，第一幀 OCR 找到 {len(initial_detections)} 個候選，建立 {len(tracks)} 個獨立 ID。',
+                hit_frame, roi=manual_roi, mode='INIT',
+                initial_detection_count=len(initial_detections), initial_track_count=len(tracks),
+                initialization_scan=True)
             if self.target_text.strip():
-                self.progress_signal.emit(hit_frame, '追蹤開始；將持續顯示即時監控，並定期回溯補查缺漏影格...')
+                self.progress_signal.emit(
+                    hit_frame,
+                    f'起始影格已建立 {len(tracks)} 個目標 ID；後續若仍漏檢，會在新目標被找到後回溯補查前段。')
 
             frame_h, frame_w = first_frame.shape[:2]
 
-            # Start output history at the initialization frame.
-            # ID identity is retained as history[track_id][absolute_frame] = ROI.
-            # Export data remains the GUI-compatible list of ROIs per frame.
+            # Start output history at the initialization frame. The manual ROI is the mask
+            # geometry; its matched OCR box, when available, is the trusted text anchor.
             history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
-            # Only OCR/manual initialization frames are trusted anchors. Visual tracker boxes
-            # may drift after fast motion and must not be used as the left anchor for backfill.
             ocr_history = {tid: {hit_frame: tuple(t['roi'])} for tid, t in tracks.items()}
+            if matched_initial_index is not None:
+                ocr_history[manual_id][hit_frame] = tuple(map(int, initial_detections[matched_initial_index][0]))
+            for tid, track in tracks.items():
+                if tid != manual_id:
+                    ocr_history[tid][hit_frame] = tuple(map(int, track['roi']))
             data[hit_frame] = [tuple(t['roi']) for t in tracks.values()]
-            # 先送出第一張監控影格，再載入 OCR 引擎；UI 不必等待 OCR 初始化完成。
             self._draw_monitor(first_frame, hit_frame, tracks, 'TRACK MODE')
-            if self.target_text.strip():
-                self.progress_signal.emit(hit_frame, '監控已啟動；正在背景初始化 RapidOCR...')
-                self._report('monitor_ready', '即時監控已顯示，OCR 引擎正在背景初始化。', hit_frame,
-                             monitor_ready=True, track_ids=list(tracks.keys()))
-                reader = self._create_reader()
-                self._report('ocr_engine', f"OCR 引擎已載入：{reader.get('backend', 'unknown')}", hit_frame)
             previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
             cached_global_motion = cached_camera_dx = cached_camera_dy = 0.0
             cached_global_points = 0
@@ -1535,7 +1717,7 @@ class OCRTrackingThread(QThread):
                         recovery_due.append(tid)
 
                 if reader is not None:
-                    # Full-frame OCR only at sparse keyframes (default every 12 frames),
+                    # Full-frame OCR only at sparse keyframes (default every 5 frames),
                     # resized to at most 960 px. This is necessary to find a target that
                     # appears outside the selected object's local search area.
                     if should_global_ocr:
@@ -1629,8 +1811,8 @@ class OCRTrackingThread(QThread):
                             dist = math.hypot(pc[0]-dc[0], pc[1]-dc[1])
                             iou = self._iou(pred, box)
                             app = self._appearance_score(tr.get('appearance'), self._appearance(frame, box))
-                            text_match = (not self.target_text.strip() or 
-                                        self._normalize(self.target_text) in self._normalize(text))
+                            text_match = (not self.target_text.strip() or
+                                          self._target_text_evidence(text, conf)['decision'] == 'ACCEPT')
                             
                             dir_penalty = 0.0
                             if expected_speed > 3.0:
@@ -1650,27 +1832,28 @@ class OCRTrackingThread(QThread):
                             lost_gate = max(gate, min(math.hypot(frame_w, frame_h) * 0.45, 900.0))
                             effective_gate = lost_gate if (lost_track and text_match) else gate
                             
-                            motion_score = max(0.0, 1.0 - (dist / effective_gate))
-                            motion_score = max(0.0, motion_score - dir_penalty)
-                            ocr_score = conf if text_match else 0.0
-                            
-                            fuzzy_result = IntuitionisticFuzzyDecision.evaluate(
-                                ocr_confidence=ocr_score,
-                                motion_score=motion_score,
-                                appearance_score=app,
-                                iou_score=iou
+                            # Explicit association cost: geometry + appearance + motion.
+                            # Fuzzy inference is intentionally NOT involved in ID assignment.
+                            # A candidate outside the allowed motion gate cannot claim this ID.
+                            if dist > effective_gate:
+                                cost[i, j] = 1e6
+                                continue
+
+                            motion_cost = min(1.0, dist / max(1.0, effective_gate))
+                            appearance_cost = 1.0 - float(np.clip(app, 0.0, 1.0))
+                            iou_cost = 1.0 - float(np.clip(iou, 0.0, 1.0))
+                            direction_cost = min(1.0, max(0.0, dir_penalty) / 0.40)
+                            normalized_size_change = min(1.0, max(0.0, size_change))
+
+                            base_cost = (
+                                0.42 * motion_cost
+                                + 0.24 * iou_cost
+                                + 0.20 * appearance_cost
+                                + 0.09 * direction_cost
+                                + 0.05 * normalized_size_change
                             )
-                            
-                            base_cost = fuzzy_result['nu'] + 0.35 * fuzzy_result['pi'] + size_penalty
-                            
-                            if fuzzy_result['decision'] == 'REJECT':
-                                base_cost += 1.0
-                            elif fuzzy_result['decision'] == 'UNCERTAIN':
-                                if lost_track and text_match and conf >= 0.4:
-                                    base_cost += 0.10
-                                else:
-                                    base_cost += 0.35
-                                
+                            if not text_match:
+                                base_cost += 0.25
                             cost[i, j] = base_cost
                                     
                     if linear_sum_assignment is not None:
@@ -1725,8 +1908,10 @@ class OCRTrackingThread(QThread):
                                int(tr.get('last_ocr_frame', -10**9)) == frame_no
                                for tr in tracks.values()):
                             continue
-                        if self.target_text.strip() and self._normalize(self.target_text) not in self._normalize(det[1]):
-                            continue
+                        if self.target_text.strip():
+                            target_evidence = self._target_text_evidence(det[1], det[2])
+                            if target_evidence['decision'] != 'ACCEPT':
+                                continue
                         tracks[next_id] = self._new_track(frame, det[0], next_id, frame_no, det[1], det[2])
                         history[next_id] = {}
                         ocr_history[next_id] = {frame_no: tuple(map(int, det[0]))}
